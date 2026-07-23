@@ -1,0 +1,38 @@
+name: Feature Pipeline (hourly)
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-feature-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas python-dotenv
+
+      - name: Run feature pipeline
+        env:
+          OPENWEATHER_API_KEY: ${{ secrets.OPENWEATHER_API_KEY }}
+          CITY_NAME: ${{ vars.CITY_NAME }}
+          LAT: ${{ vars.LAT }}
+          LON: ${{ vars.LON }}
+        run: python feature_pipeline.py
+
+      - name: Commit updated data
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/features.csv || true
+          git diff --cached --quiet || git commit -m "Update features [automated]"
+          git push || true
