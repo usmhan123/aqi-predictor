@@ -13,13 +13,11 @@ What this script does:
    - Derived features (AQI change rate vs. the previous stored reading)
 3. Stores the resulting feature row in:
    - Hopsworks Feature Store, if HOPSWORKS_API_KEY is set, OR
-   - A local CSV file (data/features.csv) as a fallback, so you can
-     start collecting data today even before your Hopsworks account
-     is fully configured.
+   - A local CSV file (data/features.csv) as a fallback.
 
 Run modes:
   python feature_pipeline.py                # fetch "now" and store one row
-  python feature_pipeline.py --backfill 30   # backfill last 30 days (see note below)
+  python feature_pipeline.py --backfill 30   # backfill last 30 days
 """
 
 import os
@@ -40,6 +38,7 @@ LAT = float(os.getenv("LAT", "33.6844"))
 LON = float(os.getenv("LON", "73.0479"))
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT")
+HOPSWORKS_HOST = os.getenv("HOPSWORKS_HOST")  # e.g. "eu-west.cloud.hopsworks.ai"
 
 DATA_DIR = Path(__file__).parent / "data"
 LOCAL_CSV = DATA_DIR / "features.csv"
@@ -50,7 +49,7 @@ WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 
 def fetch_current_pollution():
-    """Fetch current air pollution data (includes OpenWeather's own AQI 1-5 index + raw pollutants)."""
+    """Fetch current air pollution data."""
     params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY}
     resp = requests.get(AIR_POLLUTION_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -78,9 +77,7 @@ def fetch_current_weather():
 
 
 def openweather_aqi_to_us_aqi(components: dict) -> float:
-    """
-    Convert raw PM2.5 concentration (µg/m³) to a US EPA-style AQI value.
-    """
+    """Convert raw PM2.5 concentration (µg/m³) to a US EPA-style AQI value."""
     pm25 = components.get("pm2_5", 0)
     breakpoints = [
         (0.0, 12.0, 0, 50),
@@ -94,7 +91,7 @@ def openweather_aqi_to_us_aqi(components: dict) -> float:
     for c_lo, c_hi, i_lo, i_hi in breakpoints:
         if c_lo <= pm25 <= c_hi:
             return round(((i_hi - i_lo) / (c_hi - c_lo)) * (pm25 - c_lo) + i_lo, 1)
-    return 500.0  # cap at max
+    return 500.0
 
 
 def build_feature_row(pollution: dict, weather: dict, timestamp: dt.datetime) -> dict:
@@ -139,7 +136,33 @@ def store_to_hopsworks(df: pd.DataFrame):
     """Push the feature dataframe to a Hopsworks Feature Group."""
     import hopsworks
 
-    project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+    # Hopsworks requires the event_time column to be an actual datetime
+    # type (not a string), so convert it here before inserting.
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    # Force a consistent float type on all numeric measurement columns.
+    # Without this, a value that happens to be a whole number (e.g. wind
+    # speed of exactly 2.0) can get inferred as an integer on first
+    # insert, locking in a schema that later float values won't match.
+    float_columns = [
+        "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
+        "temp_c", "humidity", "pressure", "wind_speed", "wind_deg",
+        "clouds_pct", "aqi_us", "aqi_change_rate",
+    ]
+    for col in float_columns:
+        if col in df.columns:
+            df[col] = df[col].astype("float64")
+
+    cert_dir = Path(__file__).parent / "hopsworks_certs"
+    cert_dir.mkdir(exist_ok=True)
+    project = hopsworks.login(
+        api_key_value=HOPSWORKS_API_KEY,
+        project=HOPSWORKS_PROJECT,
+        host=HOPSWORKS_HOST,
+        port=443,
+        cert_folder=str(cert_dir),
+    )
     fs = project.get_feature_store()
 
     fg = fs.get_or_create_feature_group(
@@ -148,6 +171,7 @@ def store_to_hopsworks(df: pd.DataFrame):
         description="AQI + weather features for AQI forecasting",
         primary_key=["city", "timestamp"],
         event_time="timestamp",
+        time_travel_format="HUDI",
     )
     fg.insert(df, write_options={"wait_for_job": False})
     print(f"Inserted {len(df)} row(s) into Hopsworks feature group 'aqi_features'.")
@@ -176,22 +200,6 @@ def store_features(df: pd.DataFrame):
     store_locally(df)
 
 
-def add_derived_features_with_history(new_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute aqi_change_rate using the last stored row (from local CSV) as
-    context, so a single new reading still gets a meaningful change rate.
-    """
-    if LOCAL_CSV.exists():
-        history = pd.read_csv(LOCAL_CSV)
-        history = history[history["city"] == CITY_NAME]
-        if not history.empty:
-            last_aqi = history.sort_values("timestamp").iloc[-1]["aqi_us"]
-            new_df["aqi_change_rate"] = new_df["aqi_us"] - last_aqi
-            return new_df
-    new_df["aqi_change_rate"] = 0
-    return new_df
-
-
 def run_current():
     if not OPENWEATHER_API_KEY:
         sys.exit("ERROR: OPENWEATHER_API_KEY not set. Copy .env.example to .env and fill it in.")
@@ -203,6 +211,19 @@ def run_current():
     df = pd.DataFrame([row])
     df = add_derived_features_with_history(df)
     store_features(df)
+
+
+def add_derived_features_with_history(new_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute aqi_change_rate using the last stored row (from local CSV) as context."""
+    if LOCAL_CSV.exists():
+        history = pd.read_csv(LOCAL_CSV)
+        history = history[history["city"] == CITY_NAME]
+        if not history.empty:
+            last_aqi = history.sort_values("timestamp").iloc[-1]["aqi_us"]
+            new_df["aqi_change_rate"] = new_df["aqi_us"] - last_aqi
+            return new_df
+    new_df["aqi_change_rate"] = 0
+    return new_df
 
 
 def run_backfill(days: int):

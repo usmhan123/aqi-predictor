@@ -5,20 +5,16 @@ Step 2 of the AQI Predictor project.
 
 What this script does:
 1. Loads accumulated (features, target) data from the Feature Store
-   (Hopsworks if configured, otherwise the local data/features.csv
-   that feature_pipeline.py has been building up hourly).
+   (Hopsworks if configured, otherwise the local data/features.csv).
 2. Builds the REAL prediction target: AQI 3 days (72 hourly readings)
-   ahead of each row -- not just "current AQI".
-3. Trains and evaluates several models:
-   - Ridge Regression (simple, fast baseline)
-   - Random Forest Regressor (usually strongest for tabular data)
-   - MLP Regressor (a small neural network)
-4. Evaluates all three with RMSE, MAE, and R^2 on a held-out
-   time-based test split.
-5. Saves the best model (+ metadata) to Hopsworks Model Registry if
-   configured, else to a local `models/` folder.
-6. Prints Random Forest feature importances as a feature-importance
-   explanation (see note at bottom for adding real SHAP later).
+   ahead of each row.
+3. Trains and evaluates several models: Ridge Regression, Random Forest,
+   and an MLP neural network.
+4. Evaluates all three with RMSE, MAE, and R^2 on a held-out time-based
+   test split.
+5. Picks the best model by RMSE and saves it (+ metadata) to Hopsworks
+   Model Registry if configured, else a local `models/` folder.
+6. Prints Random Forest feature importances.
 
 Usage:
   python training_pipeline.py
@@ -45,12 +41,13 @@ load_dotenv()
 CITY_NAME = os.getenv("CITY_NAME", "Islamabad")
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT")
+HOPSWORKS_HOST = os.getenv("HOPSWORKS_HOST")
 
 DATA_DIR = Path(__file__).parent / "data"
 LOCAL_CSV = DATA_DIR / "features.csv"
 MODELS_DIR = Path(__file__).parent / "models"
 
-HORIZON_HOURS = 72  # 3 days ahead, since features are collected hourly
+HORIZON_HOURS = 72
 MIN_ROWS_REQUIRED = HORIZON_HOURS + 48
 
 FEATURE_COLUMNS = [
@@ -66,7 +63,15 @@ def load_data() -> pd.DataFrame:
     if HOPSWORKS_API_KEY:
         try:
             import hopsworks
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+            cert_dir = Path(__file__).parent / "hopsworks_certs"
+            cert_dir.mkdir(exist_ok=True)
+            project = hopsworks.login(
+                api_key_value=HOPSWORKS_API_KEY,
+                project=HOPSWORKS_PROJECT,
+                host=HOPSWORKS_HOST,
+                port=443,
+                cert_folder=str(cert_dir),
+            )
             fs = project.get_feature_store()
             fg = fs.get_feature_group(name="aqi_features", version=1)
             df = fg.read()
@@ -167,9 +172,18 @@ def store_model_locally(model, scaler, model_name: str, metrics: dict, all_resul
 
 
 def store_model_to_hopsworks(model, scaler, model_name: str, metrics: dict):
+    """Push the best model to the Hopsworks Model Registry."""
     import hopsworks
 
-    project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+    cert_dir = Path(__file__).parent / "hopsworks_certs"
+    cert_dir.mkdir(exist_ok=True)
+    project = hopsworks.login(
+        api_key_value=HOPSWORKS_API_KEY,
+        project=HOPSWORKS_PROJECT,
+        host=HOPSWORKS_HOST,
+        port=443,
+        cert_folder=str(cert_dir),
+    )
     mr = project.get_model_registry()
 
     MODELS_DIR.mkdir(exist_ok=True)
@@ -235,7 +249,4 @@ if __name__ == "__main__":
 #   explainer = shap.TreeExplainer(best_model)
 #   shap_values = explainer.shap_values(X_test)
 #   shap.summary_plot(shap_values, X_test)
-#
-# Kept as a manual add-on since shap can be finicky to build on some
-# Windows setups -- add it once your main pipeline works end-to-end.
 # ---------------------------------------------------------------------------

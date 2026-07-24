@@ -5,16 +5,11 @@ Step 4 of the AQI Predictor project.
 
 What this app does:
 1. Loads the trained model (+ scaler + feature list) from the Model
-   Registry (Hopsworks if configured, else the local models/ folder
-   that training_pipeline.py produced).
+   Registry (Hopsworks if configured, else the local models/ folder).
 2. Loads the latest features (Hopsworks feature store or local CSV).
 3. Computes a 3-day-ahead AQI prediction from the most recent reading.
-4. Shows a dashboard with:
-   - Current AQI + category
-   - 3-day-ahead forecast + category
-   - Historical AQI trend chart
-   - Hazard alert banner if current or forecasted AQI is unhealthy+
-   - Feature importance (if the best model was Random Forest)
+4. Shows a dashboard with current AQI, 3-day forecast, historical trend,
+   hazard alerts, and feature importance.
 
 Run:
   streamlit run app.py
@@ -35,6 +30,7 @@ load_dotenv()
 CITY_NAME = os.getenv("CITY_NAME", "Islamabad")
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT")
+HOPSWORKS_HOST = os.getenv("HOPSWORKS_HOST")
 
 DATA_DIR = Path(__file__).parent / "data"
 LOCAL_CSV = DATA_DIR / "features.csv"
@@ -69,7 +65,15 @@ def load_history() -> pd.DataFrame:
     if HOPSWORKS_API_KEY:
         try:
             import hopsworks
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+            cert_dir = Path(__file__).parent / "hopsworks_certs"
+            cert_dir.mkdir(exist_ok=True)
+            project = hopsworks.login(
+                api_key_value=HOPSWORKS_API_KEY,
+                project=HOPSWORKS_PROJECT,
+                host=HOPSWORKS_HOST,
+                port=443,
+                cert_folder=str(cert_dir),
+            )
             fs = project.get_feature_store()
             fg = fs.get_feature_group(name="aqi_features", version=1)
             df = fg.read()
@@ -88,7 +92,15 @@ def load_model():
     if HOPSWORKS_API_KEY:
         try:
             import hopsworks
-            project = hopsworks.login(api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT)
+            cert_dir = Path(__file__).parent / "hopsworks_certs"
+            cert_dir.mkdir(exist_ok=True)
+            project = hopsworks.login(
+                api_key_value=HOPSWORKS_API_KEY,
+                project=HOPSWORKS_PROJECT,
+                host=HOPSWORKS_HOST,
+                port=443,
+                cert_folder=str(cert_dir),
+            )
             mr = project.get_model_registry()
             hw_model = mr.get_model("aqi_forecast_model")
             model_dir = hw_model.download()
