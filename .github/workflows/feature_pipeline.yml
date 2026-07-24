@@ -18,7 +18,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install requests pandas python-dotenv
+        run: pip install -r requirements.txt
 
       - name: Run feature pipeline
         env:
@@ -26,9 +26,12 @@ jobs:
           CITY_NAME: ${{ vars.CITY_NAME }}
           LAT: ${{ vars.LAT }}
           LON: ${{ vars.LON }}
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT: ${{ vars.HOPSWORKS_PROJECT }}
+          HOPSWORKS_HOST: ${{ vars.HOPSWORKS_HOST }}
         run: python feature_pipeline.py
 
-      - name: Commit updated data
+      - name: Commit updated data (CSV fallback only)
         if: always()
         run: |
           git config user.name "github-actions[bot]"

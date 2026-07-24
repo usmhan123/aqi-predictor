@@ -2,7 +2,7 @@ name: Training Pipeline (daily)
 
 on:
   schedule:
-    - cron: "0 2 * * *"   # once a day, 2 AM UTC
+    - cron: "0 2 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -18,13 +18,14 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas numpy scikit-learn joblib python-dotenv
+        run: pip install pandas numpy scikit-learn joblib python-dotenv hopsworks
 
       - name: Run training pipeline
         env:
           CITY_NAME: ${{ vars.CITY_NAME }}
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT: ${{ vars.HOPSWORKS_PROJECT }}
+          HOPSWORKS_HOST: ${{ vars.HOPSWORKS_HOST }}
         run: python training_pipeline.py || echo "Training skipped -- not enough data yet"
 
       - name: Commit updated model
