@@ -18,7 +18,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas numpy scikit-learn joblib python-dotenv hopsworks confluent-kafka pyjks
+        run: pip install pandas numpy scikit-learn joblib python-dotenv hopsworks confluent-kafka pyjks tensorflow
 
       - name: Run training pipeline
         env:

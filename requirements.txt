@@ -8,3 +8,4 @@ plotly>=5.18.0
 hopsworks>=3.7.0
 confluent-kafka
 pyjks
+tensorflow

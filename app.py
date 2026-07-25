@@ -5,11 +5,17 @@ Step 4 of the AQI Predictor project.
 
 What this app does:
 1. Loads the trained model (+ scaler + feature list) from the Model
-   Registry (Hopsworks if configured, else the local models/ folder).
+   Registry (Hopsworks if configured, else the local models/ folder
+   that training_pipeline.py produced). Handles both scikit-learn
+   models (joblib) and TensorFlow/Keras models (.keras format).
 2. Loads the latest features (Hopsworks feature store or local CSV).
 3. Computes a 3-day-ahead AQI prediction from the most recent reading.
-4. Shows a dashboard with current AQI, 3-day forecast, historical trend,
-   hazard alerts, and feature importance.
+4. Shows a dashboard with:
+   - Current AQI + category
+   - 3-day-ahead forecast + category
+   - Historical AQI trend chart
+   - Hazard alert banner if current or forecasted AQI is unhealthy+
+   - Feature importance (if the best model was Random Forest)
 
 Run:
   streamlit run app.py
@@ -20,6 +26,7 @@ import json
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -87,8 +94,26 @@ def load_history() -> pd.DataFrame:
     return df[df["city"] == CITY_NAME].sort_values("timestamp")
 
 
+def _load_bundle_from_dir(model_dir: Path):
+    """Load a saved model bundle, handling both sklearn (joblib) and Keras formats."""
+    metrics_path = model_dir / "metrics.json"
+    metadata = json.loads(metrics_path.read_text()) if metrics_path.exists() else None
+    model_format = (metadata or {}).get("model_format", "sklearn")
+
+    if model_format == "keras":
+        import tensorflow as tf
+        model = tf.keras.models.load_model(model_dir / "best_model.keras")
+        meta = joblib.load(model_dir / "best_model_meta.joblib")
+        bundle = {"model": model, "scaler": meta["scaler"], "features": meta["features"]}
+    else:
+        bundle = joblib.load(model_dir / "best_model.joblib")
+
+    return bundle, metadata
+
+
 @st.cache_resource
 def load_model():
+    """Load the trained model bundle (model + scaler + feature list)."""
     if HOPSWORKS_API_KEY:
         try:
             import hopsworks
@@ -103,19 +128,15 @@ def load_model():
             )
             mr = project.get_model_registry()
             hw_model = mr.get_model("aqi_forecast_model")
-            model_dir = hw_model.download()
-            return joblib.load(Path(model_dir) / "best_model.joblib"), None
+            model_dir = Path(hw_model.download())
+            return _load_bundle_from_dir(model_dir)
         except Exception as e:
             st.warning(f"Could not load model from Hopsworks ({e}); using local model instead.")
 
-    model_path = MODELS_DIR / "best_model.joblib"
-    metrics_path = MODELS_DIR / "metrics.json"
-    if not model_path.exists():
+    if not (MODELS_DIR / "metrics.json").exists() and not (MODELS_DIR / "best_model.joblib").exists():
         return None, None
 
-    bundle = joblib.load(model_path)
-    metadata = json.loads(metrics_path.read_text()) if metrics_path.exists() else None
-    return bundle, metadata
+    return _load_bundle_from_dir(MODELS_DIR)
 
 
 def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
@@ -126,10 +147,14 @@ def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
     X = latest_row[features].fillna(0).to_frame().T
 
     model_type = type(model).__name__
-    if scaler is not None and model_type in ("Ridge", "MLPRegressor"):
+    needs_scaling = scaler is not None and (
+        model_type in ("Ridge", "MLPRegressor") or "keras" in str(type(model)).lower()
+    )
+    if needs_scaling:
         X = scaler.transform(X)
 
-    return float(model.predict(X)[0])
+    preds = model.predict(X)
+    return float(np.asarray(preds).flatten()[0])
 
 
 def main():

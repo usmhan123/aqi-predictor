@@ -8,10 +8,12 @@ What this script does:
    (Hopsworks if configured, otherwise the local data/features.csv).
 2. Builds the REAL prediction target: AQI 3 days (72 hourly readings)
    ahead of each row.
-3. Trains and evaluates several models: Ridge Regression, Random Forest,
-   and an MLP neural network.
-4. Evaluates all three with RMSE, MAE, and R^2 on a held-out time-based
-   test split.
+3. Trains and evaluates FOUR models:
+   - Ridge Regression (statistical baseline)
+   - Random Forest Regressor
+   - MLP Regressor (scikit-learn neural network)
+   - TensorFlow/Keras deep neural network
+4. Evaluates all with RMSE, MAE, and R^2 on a held-out time-based test split.
 5. Picks the best model by RMSE and saves it (+ metadata) to Hopsworks
    Model Registry if configured, else a local `models/` folder.
 6. Prints Random Forest feature importances.
@@ -126,20 +128,54 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     results = {}
     models = {}
 
+    # --- Ridge Regression baseline ---
     ridge = Ridge(alpha=1.0)
     ridge.fit(X_train_scaled, y_train)
     results["ridge_regression"] = evaluate(y_test, ridge.predict(X_test_scaled))
     models["ridge_regression"] = ridge
 
+    # --- Random Forest ---
     rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
     rf.fit(X_train, y_train)
     results["random_forest"] = evaluate(y_test, rf.predict(X_test))
     models["random_forest"] = rf
 
+    # --- Small neural network (scikit-learn MLP) ---
     mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42, early_stopping=True)
     mlp.fit(X_train_scaled, y_train)
     results["mlp_neural_net"] = evaluate(y_test, mlp.predict(X_test_scaled))
     models["mlp_neural_net"] = mlp
+
+    # --- Deep learning model (TensorFlow/Keras) ---
+    try:
+        import tensorflow as tf
+
+        tf.random.set_seed(42)
+        tf_model = tf.keras.Sequential([
+            tf.keras.layers.Input(shape=(X_train_scaled.shape[1],)),
+            tf.keras.layers.Dense(64, activation="relu"),
+            tf.keras.layers.Dropout(0.1),
+            tf.keras.layers.Dense(32, activation="relu"),
+            tf.keras.layers.Dense(1),
+        ])
+        tf_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=10, restore_best_weights=True
+        )
+        tf_model.fit(
+            X_train_scaled, y_train,
+            validation_split=0.15,
+            epochs=100,
+            batch_size=16,
+            callbacks=[early_stop],
+            verbose=0,
+        )
+        tf_preds = tf_model.predict(X_test_scaled, verbose=0).flatten()
+        results["tensorflow_nn"] = evaluate(y_test, tf_preds)
+        models["tensorflow_nn"] = tf_model
+    except ImportError:
+        print("[info] TensorFlow not installed -- skipping the deep learning model. "
+              "Install with `pip install tensorflow` to include it.")
 
     return results, models, scaler
 
@@ -152,9 +188,26 @@ def print_feature_importance(rf_model, feature_names):
         print(f"  {name:20s} {score:.4f}")
 
 
-def store_model_locally(model, scaler, model_name: str, metrics: dict, all_results: dict):
+def _save_model_files(model, scaler, model_name: str):
+    """
+    Save a trained model to MODELS_DIR, handling both scikit-learn models
+    (via joblib) and TensorFlow/Keras models (via their native .keras
+    format, since joblib cannot serialize Keras models).
+    """
     MODELS_DIR.mkdir(exist_ok=True)
-    joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, MODELS_DIR / "best_model.joblib")
+    is_keras = hasattr(model, "save") and "keras" in str(type(model)).lower()
+
+    if is_keras:
+        model.save(MODELS_DIR / "best_model.keras")
+        joblib.dump({"scaler": scaler, "features": FEATURE_COLUMNS}, MODELS_DIR / "best_model_meta.joblib")
+        return "keras"
+    else:
+        joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, MODELS_DIR / "best_model.joblib")
+        return "sklearn"
+
+
+def store_model_locally(model, scaler, model_name: str, metrics: dict, all_results: dict):
+    model_format = _save_model_files(model, scaler, model_name)
 
     metadata = {
         "selected_model": model_name,
@@ -163,11 +216,12 @@ def store_model_locally(model, scaler, model_name: str, metrics: dict, all_resul
         "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "horizon_hours": HORIZON_HOURS,
         "feature_columns": FEATURE_COLUMNS,
+        "model_format": model_format,
     }
     with open(MODELS_DIR / "metrics.json", "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\nSaved best model ('{model_name}') to {MODELS_DIR / 'best_model.joblib'}")
+    print(f"\nSaved best model ('{model_name}', format={model_format}) to {MODELS_DIR}")
     print(f"Saved metrics/metadata to {MODELS_DIR / 'metrics.json'}")
 
 
@@ -186,14 +240,21 @@ def store_model_to_hopsworks(model, scaler, model_name: str, metrics: dict):
     )
     mr = project.get_model_registry()
 
-    MODELS_DIR.mkdir(exist_ok=True)
-    local_path = MODELS_DIR / "best_model.joblib"
-    joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, local_path)
+    model_format = _save_model_files(model, scaler, model_name)
+    metadata = {
+        "selected_model": model_name,
+        "selected_model_metrics": metrics,
+        "horizon_hours": HORIZON_HOURS,
+        "feature_columns": FEATURE_COLUMNS,
+        "model_format": model_format,
+    }
+    with open(MODELS_DIR / "metrics.json", "w") as f:
+        json.dump(metadata, f, indent=2)
 
     hw_model = mr.python.create_model(
         name="aqi_forecast_model",
         metrics=metrics,
-        description=f"AQI 3-day forecast model ({model_name})",
+        description=f"AQI 3-day forecast model ({model_name}, format={model_format})",
     )
     hw_model.save(str(MODELS_DIR))
     print(f"Uploaded model to Hopsworks Model Registry as 'aqi_forecast_model'.")
