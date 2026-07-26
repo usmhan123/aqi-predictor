@@ -1,274 +1,152 @@
 """
-Training Pipeline — AQI Predictor
-===================================
-Step 2 of the AQI Predictor project.
+Feature Pipeline — AQI Predictor
+==================================
+Step 1 of the AQI Predictor project.
 
 What this script does:
-1. Loads accumulated (features, target) data from the Feature Store
-   (Hopsworks if configured, otherwise the local data/features.csv).
-2. Builds THREE separate prediction targets, matching the project's
-   "next 3 days" forecast requirement:
-     - Day 1 ahead  (24 hourly readings ahead)
-     - Day 2 ahead  (48 hourly readings ahead)
-     - Day 3 ahead  (72 hourly readings ahead)
-   Training one model per horizon gives an actual day-by-day 3-day
-   forecast (like a weather app), rather than a single point estimate
-   for "3 days from now".
-3. For each horizon, trains and evaluates FOUR models: Ridge Regression,
-   Random Forest, an MLP (scikit-learn), and a TensorFlow/Keras deep
-   neural network -- then keeps whichever performs best (lowest RMSE).
-4. Evaluates with RMSE, MAE, and R^2 on a held-out time-based test split.
-5. Saves each horizon's best model (+ metadata) to Hopsworks Model
-   Registry if configured (as three separate registered models), else to
-   a local `models/day1/`, `models/day2/`, `models/day3/` folder each.
-6. Prints Random Forest feature importances for any horizon where RF won.
+1. Fetches raw weather + pollutant data from OpenWeather
+   (Current Weather API + Air Pollution API — one API key covers both).
+2. Computes model-ready features:
+   - Raw pollutant concentrations (PM2.5, PM10, O3, NO2, SO2, CO)
+   - Raw weather variables (temp, humidity, wind, pressure)
+   - Time-based features (hour, day, month, day_of_week)
+   - Derived features (AQI change rate vs. the previous stored reading)
+3. Stores the resulting feature row in:
+   - Hopsworks Feature Store, if HOPSWORKS_API_KEY is set, OR
+   - A local CSV file (data/features.csv) as a fallback.
 
-Usage:
-  python training_pipeline.py
+Run modes:
+  python feature_pipeline.py                # fetch "now" and store one row
+  python feature_pipeline.py --backfill 30   # backfill last 30 days
 """
 
 import os
 import sys
-import json
+import argparse
 import datetime as dt
 from pathlib import Path
 
-import numpy as np
+import requests
 import pandas as pd
 from dotenv import load_dotenv
-from sklearn.linear_model import Ridge
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import joblib
 
 load_dotenv()
 
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 CITY_NAME = os.getenv("CITY_NAME", "Islamabad")
+LAT = float(os.getenv("LAT", "33.6844"))
+LON = float(os.getenv("LON", "73.0479"))
 HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
 HOPSWORKS_PROJECT = os.getenv("HOPSWORKS_PROJECT")
 HOPSWORKS_HOST = os.getenv("HOPSWORKS_HOST")
 
 DATA_DIR = Path(__file__).parent / "data"
 LOCAL_CSV = DATA_DIR / "features.csv"
-MODELS_DIR = Path(__file__).parent / "models"
 
-# One model per horizon, so the dashboard can show an actual day-by-day
-# 3-day forecast rather than a single point estimate.
-HORIZONS = {
-    "day1": 24,
-    "day2": 48,
-    "day3": 72,
-}
-MIN_EXTRA_ROWS = 48  # need at least this many usable rows beyond the horizon shift to train+test meaningfully
-
-FEATURE_COLUMNS = [
-    "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
-    "temp_c", "humidity", "pressure", "wind_speed", "wind_deg", "clouds_pct",
-    "hour", "day", "month", "day_of_week", "aqi_change_rate",
-]
-TARGET_COLUMN = "aqi_us"
+AIR_POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
+AIR_POLLUTION_HISTORY_URL = "http://api.openweathermap.org/data/2.5/air_pollution/history"
+WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 
 
-def load_data() -> pd.DataFrame:
-    """Load historical features from Hopsworks if configured, else local CSV."""
-    if HOPSWORKS_API_KEY:
-        try:
-            import hopsworks
-            cert_dir = Path(__file__).parent / "hopsworks_certs"
-            cert_dir.mkdir(exist_ok=True)
-            project = hopsworks.login(
-                api_key_value=HOPSWORKS_API_KEY,
-                project=HOPSWORKS_PROJECT,
-                host=HOPSWORKS_HOST,
-                port=443,
-                cert_folder=str(cert_dir),
-            )
-            fs = project.get_feature_store()
-            fg = fs.get_feature_group(name="aqi_features", version=1)
-            df = fg.read()
-            print(f"Loaded {len(df)} rows from Hopsworks feature group 'aqi_features'.")
-            return df
-        except Exception as e:
-            print(f"[warn] Could not load from Hopsworks ({e}); falling back to local CSV.")
-
-    if not LOCAL_CSV.exists():
-        sys.exit(f"ERROR: No data found at {LOCAL_CSV}. Run feature_pipeline.py first (and let it run hourly for a while).")
-
-    df = pd.read_csv(LOCAL_CSV)
-    df = df[df["city"] == CITY_NAME]
-    print(f"Loaded {len(df)} rows from local CSV for city={CITY_NAME}.")
-    return df
+def fetch_current_pollution():
+    """Fetch current air pollution data."""
+    params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY}
+    resp = requests.get(AIR_POLLUTION_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["list"][0]
 
 
-def build_forecast_target(df: pd.DataFrame, horizon_hours: int) -> pd.DataFrame:
-    """Shift aqi_us backwards by horizon_hours rows to create the target for this horizon."""
+def fetch_pollution_history(start_unix, end_unix):
+    """Fetch historical air pollution data for a unix time range."""
+    params = {
+        "lat": LAT, "lon": LON,
+        "start": start_unix, "end": end_unix,
+        "appid": OPENWEATHER_API_KEY,
+    }
+    resp = requests.get(AIR_POLLUTION_HISTORY_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("list", [])
+
+
+def fetch_current_weather():
+    """Fetch current weather (temperature, humidity, wind, pressure)."""
+    params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY, "units": "metric"}
+    resp = requests.get(WEATHER_URL, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def openweather_aqi_to_us_aqi(components: dict) -> float:
+    """Convert raw PM2.5 concentration (µg/m³) to a US EPA-style AQI value."""
+    pm25 = components.get("pm2_5", 0)
+    breakpoints = [
+        (0.0, 12.0, 0, 50),
+        (12.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 150.4, 151, 200),
+        (150.5, 250.4, 201, 300),
+        (250.5, 350.4, 301, 400),
+        (350.5, 500.4, 401, 500),
+    ]
+    for c_lo, c_hi, i_lo, i_hi in breakpoints:
+        if c_lo <= pm25 <= c_hi:
+            return round(((i_hi - i_lo) / (c_hi - c_lo)) * (pm25 - c_lo) + i_lo, 1)
+    return 500.0
+
+
+def build_feature_row(pollution: dict, weather: dict, timestamp: dt.datetime) -> dict:
+    """Turn one raw (pollution, weather) reading into a flat feature row."""
+    components = pollution["components"]
+    aqi_us = openweather_aqi_to_us_aqi(components)
+
+    row = {
+        "timestamp": timestamp.isoformat(),
+        "city": CITY_NAME,
+        "pm2_5": components.get("pm2_5"),
+        "pm10": components.get("pm10"),
+        "o3": components.get("o3"),
+        "no2": components.get("no2"),
+        "so2": components.get("so2"),
+        "co": components.get("co"),
+        "nh3": components.get("nh3"),
+        "no": components.get("no"),
+        "temp_c": weather.get("main", {}).get("temp"),
+        "humidity": weather.get("main", {}).get("humidity"),
+        "pressure": weather.get("main", {}).get("pressure"),
+        "wind_speed": weather.get("wind", {}).get("speed"),
+        "wind_deg": weather.get("wind", {}).get("deg"),
+        "clouds_pct": weather.get("clouds", {}).get("all"),
+        "hour": timestamp.hour,
+        "day": timestamp.day,
+        "month": timestamp.month,
+        "day_of_week": timestamp.weekday(),
+        "aqi_us": aqi_us,
+    }
+    return row
+
+
+def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add AQI change-rate feature relative to the previous row, once sorted by time."""
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df = df.copy()
-    df["target"] = df[TARGET_COLUMN].shift(-horizon_hours)
-    df = df.dropna(subset=["target"])
+    df["aqi_change_rate"] = df["aqi_us"].diff().fillna(0)
     return df
 
 
-def time_based_split(df: pd.DataFrame, test_frac: float = 0.2):
-    """Split by time order (not randomly) -- essential for time series data."""
-    split_idx = int(len(df) * (1 - test_frac))
-    return df.iloc[:split_idx], df.iloc[split_idx:]
-
-
-def evaluate(y_true, y_pred) -> dict:
-    return {
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "r2": float(r2_score(y_true, y_pred)),
-    }
-
-
-def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
-    X_train = train_df[FEATURE_COLUMNS].fillna(0)
-    y_train = train_df["target"]
-    X_test = test_df[FEATURE_COLUMNS].fillna(0)
-    y_test = test_df["target"]
-
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-
-    results = {}
-    models = {}
-
-    ridge = Ridge(alpha=1.0)
-    ridge.fit(X_train_scaled, y_train)
-    results["ridge_regression"] = evaluate(y_test, ridge.predict(X_test_scaled))
-    models["ridge_regression"] = ridge
-
-    rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
-    rf.fit(X_train, y_train)
-    results["random_forest"] = evaluate(y_test, rf.predict(X_test))
-    models["random_forest"] = rf
-
-    mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42, early_stopping=True)
-    mlp.fit(X_train_scaled, y_train)
-    results["mlp_neural_net"] = evaluate(y_test, mlp.predict(X_test_scaled))
-    models["mlp_neural_net"] = mlp
-
-    try:
-        import tensorflow as tf
-
-        tf.random.set_seed(42)
-        tf_model = tf.keras.Sequential([
-            tf.keras.layers.Input(shape=(X_train_scaled.shape[1],)),
-            tf.keras.layers.Dense(64, activation="relu"),
-            tf.keras.layers.Dropout(0.1),
-            tf.keras.layers.Dense(32, activation="relu"),
-            tf.keras.layers.Dense(1),
-        ])
-        tf_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-        early_stop = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
-        tf_model.fit(
-            X_train_scaled, y_train,
-            validation_split=0.15, epochs=100, batch_size=16,
-            callbacks=[early_stop], verbose=0,
-        )
-        tf_preds = tf_model.predict(X_test_scaled, verbose=0).flatten()
-        results["tensorflow_nn"] = evaluate(y_test, tf_preds)
-        models["tensorflow_nn"] = tf_model
-    except ImportError:
-        print("[info] TensorFlow not installed -- skipping the deep learning model.")
-
-    return results, models, scaler
-
-
-def print_feature_importance(rf_model, feature_names):
-    importances = rf_model.feature_importances_
-    ranked = sorted(zip(feature_names, importances), key=lambda x: -x[1])
-    print("  Feature importance (Random Forest):")
-    for name, score in ranked[:8]:
-        print(f"    {name:20s} {score:.4f}")
-
-
-def _save_model_files(model, scaler, target_dir: Path):
-    """Save a trained model, handling both scikit-learn (joblib) and Keras (.keras) formats."""
-    target_dir.mkdir(parents=True, exist_ok=True)
-    is_keras = hasattr(model, "save") and "keras" in str(type(model)).lower()
-
-    if is_keras:
-        model.save(target_dir / "best_model.keras")
-        joblib.dump({"scaler": scaler, "features": FEATURE_COLUMNS}, target_dir / "best_model_meta.joblib")
-        return "keras"
-    else:
-        joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, target_dir / "best_model.joblib")
-        return "sklearn"
-
-
-def train_one_horizon(df: pd.DataFrame, horizon_name: str, horizon_hours: int):
-    """Train, evaluate, and save the best model for a single forecast horizon."""
-    print(f"\n{'=' * 60}\nHorizon: {horizon_name} (+{horizon_hours}h)\n{'=' * 60}")
-
-    horizon_df = build_forecast_target(df, horizon_hours)
-    min_rows_required = horizon_hours + MIN_EXTRA_ROWS
-
-    if len(horizon_df) < min_rows_required:
-        print(
-            f"  Not enough data yet: have {len(horizon_df)} usable rows, need {min_rows_required}. "
-            f"Skipping this horizon for now -- it will train automatically once enough hourly "
-            f"data has accumulated."
-        )
-        return None
-
-    train_df, test_df = time_based_split(horizon_df)
-    print(f"  Train rows: {len(train_df)}, Test rows: {len(test_df)}")
-
-    results, models, scaler = train_and_evaluate(train_df, test_df)
-
-    print("  Model comparison (held-out, time-based test split):")
-    for name, metrics in results.items():
-        print(f"    {name:20s} RMSE={metrics['rmse']:.2f}  MAE={metrics['mae']:.2f}  R2={metrics['r2']:.3f}")
-
-    best_name = min(results, key=lambda n: results[n]["rmse"])
-    best_model = models[best_name]
-    print(f"  Best model for {horizon_name}: {best_name} (lowest RMSE)")
-
-    if best_name == "random_forest":
-        print_feature_importance(best_model, FEATURE_COLUMNS)
-
-    return {
-        "horizon_name": horizon_name,
-        "horizon_hours": horizon_hours,
-        "model": best_model,
-        "scaler": scaler,
-        "model_name": best_name,
-        "metrics": results[best_name],
-        "all_results": results,
-    }
-
-
-def store_locally(horizon_results: dict):
-    for horizon_name, result in horizon_results.items():
-        if result is None:
-            continue
-        target_dir = MODELS_DIR / horizon_name
-        model_format = _save_model_files(result["model"], result["scaler"], target_dir)
-
-        metadata = {
-            "horizon_name": horizon_name,
-            "horizon_hours": result["horizon_hours"],
-            "selected_model": result["model_name"],
-            "selected_model_metrics": result["metrics"],
-            "all_model_results": result["all_results"],
-            "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "feature_columns": FEATURE_COLUMNS,
-            "model_format": model_format,
-        }
-        with open(target_dir / "metrics.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-        print(f"Saved {horizon_name} model ('{result['model_name']}', format={model_format}) to {target_dir}")
-
-
-def store_to_hopsworks(horizon_results: dict):
-    """Push each horizon's best model to the Hopsworks Model Registry as a separate registered model."""
+def store_to_hopsworks(df: pd.DataFrame):
+    """Push the feature dataframe to a Hopsworks Feature Group."""
     import hopsworks
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    float_columns = [
+        "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
+        "temp_c", "humidity", "pressure", "wind_speed", "wind_deg",
+        "clouds_pct", "aqi_us", "aqi_change_rate",
+    ]
+    for col in float_columns:
+        if col in df.columns:
+            df[col] = df[col].astype("float64")
 
     cert_dir = Path(__file__).parent / "hopsworks_certs"
     cert_dir.mkdir(exist_ok=True)
@@ -279,68 +157,106 @@ def store_to_hopsworks(horizon_results: dict):
         port=443,
         cert_folder=str(cert_dir),
     )
-    mr = project.get_model_registry()
+    fs = project.get_feature_store()
 
-    for horizon_name, result in horizon_results.items():
-        if result is None:
-            continue
-        target_dir = MODELS_DIR / horizon_name
-        model_format = _save_model_files(result["model"], result["scaler"], target_dir)
-
-        metadata = {
-            "horizon_name": horizon_name,
-            "horizon_hours": result["horizon_hours"],
-            "selected_model": result["model_name"],
-            "selected_model_metrics": result["metrics"],
-            "feature_columns": FEATURE_COLUMNS,
-            "model_format": model_format,
-        }
-        with open(target_dir / "metrics.json", "w") as f:
-            json.dump(metadata, f, indent=2)
-
-        hw_model = mr.python.create_model(
-            name=f"aqi_forecast_model_{horizon_name}",
-            metrics=result["metrics"],
-            description=f"AQI forecast model for {horizon_name} (+{result['horizon_hours']}h), "
-                         f"model={result['model_name']}, format={model_format}",
-        )
-        hw_model.save(str(target_dir))
-        print(f"Uploaded {horizon_name} model to Hopsworks Model Registry as 'aqi_forecast_model_{horizon_name}'.")
+    fg = fs.get_or_create_feature_group(
+        name="aqi_features",
+        version=1,
+        description="AQI + weather features for AQI forecasting",
+        primary_key=["city", "timestamp"],
+        event_time="timestamp",
+        time_travel_format="HUDI",
+    )
+    fg.insert(df, write_options={"wait_for_job": False})
+    print(f"Inserted {len(df)} row(s) into Hopsworks feature group 'aqi_features'.")
 
 
-def main():
-    df = load_data()
+def store_locally(df: pd.DataFrame):
+    """Append the feature dataframe to a local CSV (fallback / no Hopsworks yet)."""
+    DATA_DIR.mkdir(exist_ok=True)
+    if LOCAL_CSV.exists():
+        existing = pd.read_csv(LOCAL_CSV)
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["city", "timestamp"], keep="last")
+    else:
+        combined = df
+    combined.to_csv(LOCAL_CSV, index=False)
+    print(f"Stored {len(df)} row(s) locally. Total rows now: {len(combined)} -> {LOCAL_CSV}")
 
-    horizon_results = {}
-    for horizon_name, horizon_hours in HORIZONS.items():
-        horizon_results[horizon_name] = train_one_horizon(df, horizon_name, horizon_hours)
 
-    if all(v is None for v in horizon_results.values()):
-        sys.exit(
-            "\nNo horizon had enough data to train yet. Let feature_pipeline.py / the "
-            "GitHub Action keep running hourly and try again in a few days. This is "
-            "expected, not an error in your code."
-        )
-
+def store_features(df: pd.DataFrame):
     if HOPSWORKS_API_KEY:
         try:
-            store_to_hopsworks(horizon_results)
+            store_to_hopsworks(df)
             return
         except Exception as e:
-            print(f"[warn] Hopsworks model store failed ({e}); falling back to local storage.")
+            print(f"[warn] Hopsworks store failed ({e}); falling back to local CSV.")
+    store_locally(df)
 
-    store_locally(horizon_results)
+
+def run_current():
+    if not OPENWEATHER_API_KEY:
+        sys.exit("ERROR: OPENWEATHER_API_KEY not set. Copy .env.example to .env and fill it in.")
+
+    now = dt.datetime.now(dt.timezone.utc)
+    pollution = fetch_current_pollution()
+    weather = fetch_current_weather()
+    row = build_feature_row(pollution, weather, now)
+    df = pd.DataFrame([row])
+    df = add_derived_features_with_history(df)
+    store_features(df)
+
+
+def add_derived_features_with_history(new_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute aqi_change_rate using the last stored row (from local CSV) as context."""
+    if LOCAL_CSV.exists():
+        history = pd.read_csv(LOCAL_CSV)
+        history = history[history["city"] == CITY_NAME]
+        if not history.empty:
+            last_aqi = history.sort_values("timestamp").iloc[-1]["aqi_us"]
+            new_df["aqi_change_rate"] = new_df["aqi_us"] - last_aqi
+            return new_df
+    new_df["aqi_change_rate"] = 0
+    return new_df
+
+
+def run_backfill(days: int):
+    if not OPENWEATHER_API_KEY:
+        sys.exit("ERROR: OPENWEATHER_API_KEY not set. Copy .env.example to .env and fill it in.")
+
+    end = dt.datetime.now(dt.timezone.utc)
+    start = end - dt.timedelta(days=days)
+    print(f"Backfilling pollution history from {start} to {end} ...")
+
+    try:
+        history_list = fetch_pollution_history(int(start.timestamp()), int(end.timestamp()))
+    except requests.HTTPError as e:
+        sys.exit(
+            "Historical air-pollution request failed "
+            f"({e}). Your OpenWeather plan may not include history access. "
+            "Run this script hourly via GitHub Actions instead to build up real history over time."
+        )
+
+    if not history_list:
+        sys.exit("No historical data returned. Try a smaller --backfill window or check your plan.")
+
+    weather_now = fetch_current_weather()
+    rows = []
+    for entry in history_list:
+        ts = dt.datetime.fromtimestamp(entry["dt"], tz=dt.timezone.utc)
+        rows.append(build_feature_row(entry, weather_now, ts))
+
+    df = pd.DataFrame(rows)
+    df = add_derived_features(df)
+    store_features(df)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="AQI Predictor feature pipeline")
+    parser.add_argument("--backfill", type=int, default=0, help="Number of past days to backfill")
+    args = parser.parse_args()
 
-# ---------------------------------------------------------------------------
-# NOTE ON SHAP: once you have trained models and want proper SHAP-based
-# explanations, install shap separately (`pip install shap`) and run, e.g.:
-#
-#   import shap
-#   explainer = shap.TreeExplainer(best_model)   # for a Random Forest horizon
-#   shap_values = explainer.shap_values(X_test)
-#   shap.summary_plot(shap_values, X_test)
-# ---------------------------------------------------------------------------
+    if args.backfill > 0:
+        run_backfill(args.backfill)
+    else:
+        run_current()
