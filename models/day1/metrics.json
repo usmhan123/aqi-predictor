@@ -1,0 +1,53 @@
+{
+  "horizon_name": "day1",
+  "horizon_hours": 24,
+  "selected_model": "ridge_regression",
+  "selected_model_metrics": {
+    "rmse": 17.513662218713606,
+    "mae": 13.298019839861066,
+    "r2": 0.2883313867147336
+  },
+  "feature_columns": [
+    "pm2_5",
+    "pm10",
+    "o3",
+    "no2",
+    "so2",
+    "co",
+    "nh3",
+    "no",
+    "temp_c",
+    "humidity",
+    "pressure",
+    "wind_speed",
+    "wind_deg",
+    "clouds_pct",
+    "hour",
+    "day",
+    "month",
+    "day_of_week",
+    "aqi_change_rate"
+  ],
+  "model_format": "sklearn",
+  "shap_importance": {
+    "month": 72.42279418156666,
+    "day": 56.64553382333643,
+    "day_of_week": 14.763946578064111,
+    "o3": 12.664811212123517,
+    "co": 12.236319618984542,
+    "so2": 9.978514819479068,
+    "nh3": 3.4006718480865032,
+    "hour": 2.2674061259346963,
+    "pressure": 1.8052842409042518,
+    "pm10": 1.2388469023509214,
+    "no": 0.984552969459466,
+    "temp_c": 0.7495852791840377,
+    "humidity": 0.7319984090962287,
+    "no2": 0.6908741474295941,
+    "aqi_change_rate": 0.30269973980656306,
+    "pm2_5": 0.2478509474506322,
+    "wind_deg": 0.14433826562926513,
+    "wind_speed": 0.062430211873717355,
+    "clouds_pct": 0.04646511970712411
+  }
+}

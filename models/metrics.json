@@ -1,0 +1,31 @@
+{
+  "selected_model": "random_forest",
+  "selected_model_metrics": {
+    "rmse": 25.8378123361231,
+    "mae": 22.146528789342025,
+    "r2": -0.6238345513465908
+  },
+  "horizon_hours": 72,
+  "feature_columns": [
+    "pm2_5",
+    "pm10",
+    "o3",
+    "no2",
+    "so2",
+    "co",
+    "nh3",
+    "no",
+    "temp_c",
+    "humidity",
+    "pressure",
+    "wind_speed",
+    "wind_deg",
+    "clouds_pct",
+    "hour",
+    "day",
+    "month",
+    "day_of_week",
+    "aqi_change_rate"
+  ],
+  "model_format": "sklearn"
+}

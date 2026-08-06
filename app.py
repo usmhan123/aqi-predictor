@@ -17,7 +17,7 @@ What this app does:
    - Day 1 / Day 2 / Day 3 forecast cards
    - Historical AQI trend chart
    - Hazard alert banner if current or any forecasted day is unhealthy+
-   - Feature importance (for whichever horizon's best model was Random Forest)
+   - SHAP-based feature importance (works for any of the 4 model types)
 
 Run:
   streamlit run app.py
@@ -255,12 +255,13 @@ def main():
 
     for horizon_key, (day_label, _) in HORIZONS.items():
         bundle, metadata = all_models.get(horizon_key, (None, None))
-        if metadata and metadata.get("selected_model") == "random_forest" and bundle is not None:
-            st.subheader(f"What's driving the {day_label} forecast? (Feature importance)")
-            rf = bundle["model"]
-            importances = pd.Series(rf.feature_importances_, index=bundle["features"]).sort_values(ascending=False).head(10)
+        shap_importance = (metadata or {}).get("shap_importance")
+        if shap_importance and bundle is not None:
+            st.subheader(f"What's driving the {day_label} forecast? (SHAP feature importance)")
+            st.caption(f"Model: {metadata['selected_model']}")
+            importances = pd.Series(shap_importance).sort_values(ascending=False).head(10)
             fig2 = go.Figure(go.Bar(x=importances.values, y=importances.index, orientation="h"))
-            fig2.update_layout(height=350, xaxis_title="Importance", yaxis=dict(autorange="reversed"))
+            fig2.update_layout(height=350, xaxis_title="Mean |SHAP value|", yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig2, use_container_width=True)
 
     with st.expander("View raw feature data"):

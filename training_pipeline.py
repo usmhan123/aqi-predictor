@@ -6,17 +6,24 @@ Step 2 of the AQI Predictor project.
 What this script does:
 1. Loads accumulated (features, target) data from the Feature Store
    (Hopsworks if configured, otherwise the local data/features.csv).
-2. Builds the REAL prediction target: AQI 3 days (72 hourly readings)
-   ahead of each row.
-3. Trains and evaluates FOUR models:
-   - Ridge Regression (statistical baseline)
-   - Random Forest Regressor
-   - MLP Regressor (scikit-learn neural network)
-   - TensorFlow/Keras deep neural network
-4. Evaluates all with RMSE, MAE, and R^2 on a held-out time-based test split.
-5. Picks the best model by RMSE and saves it (+ metadata) to Hopsworks
-   Model Registry if configured, else a local `models/` folder.
-6. Prints Random Forest feature importances.
+2. Builds THREE separate prediction targets, matching the project's
+   "next 3 days" forecast requirement:
+     - Day 1 ahead  (24 hourly readings ahead)
+     - Day 2 ahead  (48 hourly readings ahead)
+     - Day 3 ahead  (72 hourly readings ahead)
+   Training one model per horizon gives an actual day-by-day 3-day
+   forecast (like a weather app), rather than a single point estimate
+   for "3 days from now".
+3. For each horizon, trains and evaluates FOUR models: Ridge Regression,
+   Random Forest, an MLP (scikit-learn), and a TensorFlow/Keras deep
+   neural network -- then keeps whichever performs best (lowest RMSE).
+4. Evaluates with RMSE, MAE, and R^2 on a held-out time-based test split.
+5. Computes SHAP feature-importance explanations for whichever model
+   type won each horizon (Random Forest, Ridge, MLP, or TensorFlow).
+6. Saves each horizon's best model (+ metadata, including SHAP values)
+   to Hopsworks Model Registry if configured (as three separate
+   registered models), else to a local `models/day1/`, `models/day2/`,
+   `models/day3/` folder each.
 
 Usage:
   python training_pipeline.py
@@ -49,8 +56,12 @@ DATA_DIR = Path(__file__).parent / "data"
 LOCAL_CSV = DATA_DIR / "features.csv"
 MODELS_DIR = Path(__file__).parent / "models"
 
-HORIZON_HOURS = 72
-MIN_ROWS_REQUIRED = HORIZON_HOURS + 48
+HORIZONS = {
+    "day1": 24,
+    "day2": 48,
+    "day3": 72,
+}
+MIN_EXTRA_ROWS = 48
 
 FEATURE_COLUMNS = [
     "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
@@ -91,20 +102,19 @@ def load_data() -> pd.DataFrame:
     return df
 
 
-def build_forecast_target(df: pd.DataFrame) -> pd.DataFrame:
-    """Shift aqi_us backwards by HORIZON_HOURS rows to create a proper 3-day-ahead target."""
+def build_forecast_target(df: pd.DataFrame, horizon_hours: int) -> pd.DataFrame:
+    """Shift aqi_us backwards by horizon_hours rows to create the target for this horizon."""
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df["target_aqi_3d"] = df[TARGET_COLUMN].shift(-HORIZON_HOURS)
-    df = df.dropna(subset=["target_aqi_3d"])
+    df = df.copy()
+    df["target"] = df[TARGET_COLUMN].shift(-horizon_hours)
+    df = df.dropna(subset=["target"])
     return df
 
 
 def time_based_split(df: pd.DataFrame, test_frac: float = 0.2):
     """Split by time order (not randomly) -- essential for time series data."""
     split_idx = int(len(df) * (1 - test_frac))
-    train_df = df.iloc[:split_idx]
-    test_df = df.iloc[split_idx:]
-    return train_df, test_df
+    return df.iloc[:split_idx], df.iloc[split_idx:]
 
 
 def evaluate(y_true, y_pred) -> dict:
@@ -117,9 +127,9 @@ def evaluate(y_true, y_pred) -> dict:
 
 def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     X_train = train_df[FEATURE_COLUMNS].fillna(0)
-    y_train = train_df["target_aqi_3d"]
+    y_train = train_df["target"]
     X_test = test_df[FEATURE_COLUMNS].fillna(0)
-    y_test = test_df["target_aqi_3d"]
+    y_test = test_df["target"]
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -128,25 +138,21 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
     results = {}
     models = {}
 
-    # --- Ridge Regression baseline ---
     ridge = Ridge(alpha=1.0)
     ridge.fit(X_train_scaled, y_train)
     results["ridge_regression"] = evaluate(y_test, ridge.predict(X_test_scaled))
     models["ridge_regression"] = ridge
 
-    # --- Random Forest ---
     rf = RandomForestRegressor(n_estimators=200, max_depth=10, random_state=42, n_jobs=-1)
     rf.fit(X_train, y_train)
     results["random_forest"] = evaluate(y_test, rf.predict(X_test))
     models["random_forest"] = rf
 
-    # --- Small neural network (scikit-learn MLP) ---
     mlp = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42, early_stopping=True)
     mlp.fit(X_train_scaled, y_train)
     results["mlp_neural_net"] = evaluate(y_test, mlp.predict(X_test_scaled))
     models["mlp_neural_net"] = mlp
 
-    # --- Deep learning model (TensorFlow/Keras) ---
     try:
         import tensorflow as tf
 
@@ -159,74 +165,157 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
             tf.keras.layers.Dense(1),
         ])
         tf_model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-        early_stop = tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True
-        )
+        early_stop = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
         tf_model.fit(
             X_train_scaled, y_train,
-            validation_split=0.15,
-            epochs=100,
-            batch_size=16,
-            callbacks=[early_stop],
-            verbose=0,
+            validation_split=0.15, epochs=100, batch_size=16,
+            callbacks=[early_stop], verbose=0,
         )
         tf_preds = tf_model.predict(X_test_scaled, verbose=0).flatten()
         results["tensorflow_nn"] = evaluate(y_test, tf_preds)
         models["tensorflow_nn"] = tf_model
     except ImportError:
-        print("[info] TensorFlow not installed -- skipping the deep learning model. "
-              "Install with `pip install tensorflow` to include it.")
+        print("[info] TensorFlow not installed -- skipping the deep learning model.")
 
     return results, models, scaler
 
 
-def print_feature_importance(rf_model, feature_names):
-    importances = rf_model.feature_importances_
-    ranked = sorted(zip(feature_names, importances), key=lambda x: -x[1])
-    print("\nFeature importance (Random Forest):")
-    for name, score in ranked[:10]:
-        print(f"  {name:20s} {score:.4f}")
+def compute_shap_importance(model, model_name: str, scaler, X_train: pd.DataFrame, X_test: pd.DataFrame, feature_names):
+    """
+    Compute SHAP feature importance for whichever model type won this
+    horizon. Dispatches to the right SHAP explainer per model family:
+      - Random Forest    -> TreeExplainer (fast, exact)
+      - Ridge             -> LinearExplainer
+      - MLP / TensorFlow  -> KernelExplainer (model-agnostic, slower --
+        kept small with a limited background/sample size)
+    Returns a dict of {feature_name: mean_abs_shap_value}, sorted
+    descending, or None if SHAP computation isn't feasible.
+    """
+    try:
+        import shap
+
+        sample_size = min(30, len(X_test))
+        X_sample = X_test.iloc[:sample_size]
+
+        if model_name == "random_forest":
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_sample)
+        elif model_name == "ridge_regression":
+            X_train_scaled = scaler.transform(X_train)
+            X_sample_scaled = scaler.transform(X_sample)
+            explainer = shap.LinearExplainer(model, X_train_scaled)
+            shap_values = explainer.shap_values(X_sample_scaled)
+        else:
+            background = shap.sample(scaler.transform(X_train), min(20, len(X_train)))
+            X_sample_scaled = scaler.transform(X_sample)
+
+            if model_name == "tensorflow_nn":
+                predict_fn = lambda x: model.predict(x, verbose=0).flatten()
+            else:
+                predict_fn = model.predict
+
+            explainer = shap.KernelExplainer(predict_fn, background)
+            shap_values = explainer.shap_values(X_sample_scaled, nsamples=50, silent=True)
+
+        mean_abs_shap = np.abs(np.array(shap_values)).mean(axis=0)
+        ranked = sorted(zip(feature_names, mean_abs_shap.tolist()), key=lambda x: -x[1])
+        return dict(ranked)
+    except Exception as e:
+        print(f"  [warn] SHAP computation failed ({e}); skipping feature explanations for this horizon.")
+        return None
 
 
-def _save_model_files(model, scaler, model_name: str):
-    """
-    Save a trained model to MODELS_DIR, handling both scikit-learn models
-    (via joblib) and TensorFlow/Keras models (via their native .keras
-    format, since joblib cannot serialize Keras models).
-    """
-    MODELS_DIR.mkdir(exist_ok=True)
+def print_shap_importance(shap_importance: dict):
+    print("  SHAP feature importance:")
+    for name, score in list(shap_importance.items())[:8]:
+        print(f"    {name:20s} {score:.4f}")
+
+
+def _save_model_files(model, scaler, target_dir: Path):
+    """Save a trained model, handling both scikit-learn (joblib) and Keras (.keras) formats."""
+    target_dir.mkdir(parents=True, exist_ok=True)
     is_keras = hasattr(model, "save") and "keras" in str(type(model)).lower()
 
     if is_keras:
-        model.save(MODELS_DIR / "best_model.keras")
-        joblib.dump({"scaler": scaler, "features": FEATURE_COLUMNS}, MODELS_DIR / "best_model_meta.joblib")
+        model.save(target_dir / "best_model.keras")
+        joblib.dump({"scaler": scaler, "features": FEATURE_COLUMNS}, target_dir / "best_model_meta.joblib")
         return "keras"
     else:
-        joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, MODELS_DIR / "best_model.joblib")
+        joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLUMNS}, target_dir / "best_model.joblib")
         return "sklearn"
 
 
-def store_model_locally(model, scaler, model_name: str, metrics: dict, all_results: dict):
-    model_format = _save_model_files(model, scaler, model_name)
+def train_one_horizon(df: pd.DataFrame, horizon_name: str, horizon_hours: int):
+    """Train, evaluate, and save the best model for a single forecast horizon."""
+    print(f"\n{'=' * 60}\nHorizon: {horizon_name} (+{horizon_hours}h)\n{'=' * 60}")
 
-    metadata = {
-        "selected_model": model_name,
-        "selected_model_metrics": metrics,
-        "all_model_results": all_results,
-        "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "horizon_hours": HORIZON_HOURS,
-        "feature_columns": FEATURE_COLUMNS,
-        "model_format": model_format,
+    horizon_df = build_forecast_target(df, horizon_hours)
+    min_rows_required = horizon_hours + MIN_EXTRA_ROWS
+
+    if len(horizon_df) < min_rows_required:
+        print(
+            f"  Not enough data yet: have {len(horizon_df)} usable rows, need {min_rows_required}. "
+            f"Skipping this horizon for now -- it will train automatically once enough hourly "
+            f"data has accumulated."
+        )
+        return None
+
+    train_df, test_df = time_based_split(horizon_df)
+    print(f"  Train rows: {len(train_df)}, Test rows: {len(test_df)}")
+
+    results, models, scaler = train_and_evaluate(train_df, test_df)
+
+    print("  Model comparison (held-out, time-based test split):")
+    for name, metrics in results.items():
+        print(f"    {name:20s} RMSE={metrics['rmse']:.2f}  MAE={metrics['mae']:.2f}  R2={metrics['r2']:.3f}")
+
+    best_name = min(results, key=lambda n: results[n]["rmse"])
+    best_model = models[best_name]
+    print(f"  Best model for {horizon_name}: {best_name} (lowest RMSE)")
+
+    X_train = train_df[FEATURE_COLUMNS].fillna(0)
+    X_test = test_df[FEATURE_COLUMNS].fillna(0)
+    shap_importance = compute_shap_importance(best_model, best_name, scaler, X_train, X_test, FEATURE_COLUMNS)
+    if shap_importance:
+        print_shap_importance(shap_importance)
+
+    return {
+        "horizon_name": horizon_name,
+        "horizon_hours": horizon_hours,
+        "model": best_model,
+        "scaler": scaler,
+        "model_name": best_name,
+        "metrics": results[best_name],
+        "all_results": results,
+        "shap_importance": shap_importance,
     }
-    with open(MODELS_DIR / "metrics.json", "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"\nSaved best model ('{model_name}', format={model_format}) to {MODELS_DIR}")
-    print(f"Saved metrics/metadata to {MODELS_DIR / 'metrics.json'}")
 
 
-def store_model_to_hopsworks(model, scaler, model_name: str, metrics: dict):
-    """Push the best model to the Hopsworks Model Registry."""
+def store_locally(horizon_results: dict):
+    for horizon_name, result in horizon_results.items():
+        if result is None:
+            continue
+        target_dir = MODELS_DIR / horizon_name
+        model_format = _save_model_files(result["model"], result["scaler"], target_dir)
+
+        metadata = {
+            "horizon_name": horizon_name,
+            "horizon_hours": result["horizon_hours"],
+            "selected_model": result["model_name"],
+            "selected_model_metrics": result["metrics"],
+            "all_model_results": result["all_results"],
+            "trained_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "feature_columns": FEATURE_COLUMNS,
+            "model_format": model_format,
+            "shap_importance": result.get("shap_importance"),
+        }
+        with open(target_dir / "metrics.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Saved {horizon_name} model ('{result['model_name']}', format={model_format}) to {target_dir}")
+
+
+def store_to_hopsworks(horizon_results: dict):
+    """Push each horizon's best model to the Hopsworks Model Registry as a separate registered model."""
     import hopsworks
 
     cert_dir = Path(__file__).parent / "hopsworks_certs"
@@ -240,74 +329,57 @@ def store_model_to_hopsworks(model, scaler, model_name: str, metrics: dict):
     )
     mr = project.get_model_registry()
 
-    model_format = _save_model_files(model, scaler, model_name)
-    metadata = {
-        "selected_model": model_name,
-        "selected_model_metrics": metrics,
-        "horizon_hours": HORIZON_HOURS,
-        "feature_columns": FEATURE_COLUMNS,
-        "model_format": model_format,
-    }
-    with open(MODELS_DIR / "metrics.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+    for horizon_name, result in horizon_results.items():
+        if result is None:
+            continue
+        target_dir = MODELS_DIR / horizon_name
+        model_format = _save_model_files(result["model"], result["scaler"], target_dir)
 
-    hw_model = mr.python.create_model(
-        name="aqi_forecast_model",
-        metrics=metrics,
-        description=f"AQI 3-day forecast model ({model_name}, format={model_format})",
-    )
-    hw_model.save(str(MODELS_DIR))
-    print(f"Uploaded model to Hopsworks Model Registry as 'aqi_forecast_model'.")
+        metadata = {
+            "horizon_name": horizon_name,
+            "horizon_hours": result["horizon_hours"],
+            "selected_model": result["model_name"],
+            "selected_model_metrics": result["metrics"],
+            "feature_columns": FEATURE_COLUMNS,
+            "model_format": model_format,
+            "shap_importance": result.get("shap_importance"),
+        }
+        with open(target_dir / "metrics.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        hw_model = mr.python.create_model(
+            name=f"aqi_forecast_model_{horizon_name}",
+            metrics=result["metrics"],
+            description=f"AQI forecast model for {horizon_name} (+{result['horizon_hours']}h), "
+                         f"model={result['model_name']}, format={model_format}",
+        )
+        hw_model.save(str(target_dir))
+        print(f"Uploaded {horizon_name} model to Hopsworks Model Registry as 'aqi_forecast_model_{horizon_name}'.")
 
 
 def main():
     df = load_data()
-    df = build_forecast_target(df)
 
-    if len(df) < MIN_ROWS_REQUIRED:
+    horizon_results = {}
+    for horizon_name, horizon_hours in HORIZONS.items():
+        horizon_results[horizon_name] = train_one_horizon(df, horizon_name, horizon_hours)
+
+    if all(v is None for v in horizon_results.values()):
         sys.exit(
-            f"Not enough data yet to train: have {len(df)} usable rows after building the "
-            f"3-day-ahead target, need at least {MIN_ROWS_REQUIRED}.\n"
-            f"This means you need roughly {MIN_ROWS_REQUIRED + HORIZON_HOURS} total hourly "
-            f"readings collected -- let feature_pipeline.py / the GitHub Action keep running "
-            f"and try again in a few days. This is expected, not an error in your code."
+            "\nNo horizon had enough data to train yet. Let feature_pipeline.py / the "
+            "GitHub Action keep running hourly and try again in a few days. This is "
+            "expected, not an error in your code."
         )
-
-    train_df, test_df = time_based_split(df)
-    print(f"Train rows: {len(train_df)}, Test rows: {len(test_df)}")
-
-    results, models, scaler = train_and_evaluate(train_df, test_df)
-
-    print("\nModel comparison (on held-out, time-based test split):")
-    for name, metrics in results.items():
-        print(f"  {name:20s} RMSE={metrics['rmse']:.2f}  MAE={metrics['mae']:.2f}  R2={metrics['r2']:.3f}")
-
-    best_name = min(results, key=lambda n: results[n]["rmse"])
-    best_model = models[best_name]
-    print(f"\nBest model: {best_name} (lowest RMSE)")
-
-    if best_name == "random_forest":
-        print_feature_importance(best_model, FEATURE_COLUMNS)
 
     if HOPSWORKS_API_KEY:
         try:
-            store_model_to_hopsworks(best_model, scaler, best_name, results[best_name])
+            store_to_hopsworks(horizon_results)
             return
         except Exception as e:
             print(f"[warn] Hopsworks model store failed ({e}); falling back to local storage.")
 
-    store_model_locally(best_model, scaler, best_name, results[best_name], results)
+    store_locally(horizon_results)
 
 
 if __name__ == "__main__":
     main()
-
-# ---------------------------------------------------------------------------
-# NOTE ON SHAP: once you have a trained model and want proper SHAP-based
-# explanations, install shap separately (`pip install shap`) and run:
-#
-#   import shap
-#   explainer = shap.TreeExplainer(best_model)
-#   shap_values = explainer.shap_values(X_test)
-#   shap.summary_plot(shap_values, X_test)
-# ---------------------------------------------------------------------------
