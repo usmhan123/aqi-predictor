@@ -8,7 +8,4 @@ plotly>=5.18.0
 hopsworks>=3.7.0
 confluent-kafka
 pyjks
-tensorflow
-matplotlib>=3.7.0
-seaborn>=0.12.0
 shap>=0.44.0
