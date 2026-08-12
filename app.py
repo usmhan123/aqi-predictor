@@ -287,13 +287,15 @@ def _load_bundle_from_dir(model_dir: Path):
 
 @st.cache_resource
 def load_all_models():
+    """Load all three horizon models (day1/day2/day3), whichever are available."""
     results = {}
+
     if HOPSWORKS_API_KEY:
         try:
             project = _get_hopsworks_project()
             mr = project.get_model_registry()
             for horizon_name in HORIZONS:
-                   try:
+                try:
                     candidates = mr.get_models(name=f"aqi_forecast_model_{horizon_name}")
                     hw_model = max(candidates, key=lambda m: m.version)
                     model_dir = Path(hw_model.download())
@@ -305,7 +307,6 @@ def load_all_models():
         except Exception as e:
             st.warning(f"Could not load models from Hopsworks ({e}); using local models instead.")
 
-
     results = {}
     for horizon_name in HORIZONS:
         horizon_dir = MODELS_DIR / horizon_name
@@ -314,7 +315,6 @@ def load_all_models():
         else:
             results[horizon_name] = (None, None)
     return results
-
 
 def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
     model = bundle["model"]
