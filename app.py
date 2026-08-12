@@ -288,14 +288,18 @@ def _load_bundle_from_dir(model_dir: Path):
 @st.cache_resource
 def load_all_models():
     results = {}
-
     if HOPSWORKS_API_KEY:
         try:
             project = _get_hopsworks_project()
             mr = project.get_model_registry()
             for horizon_name in HORIZONS:
                 try:
-                    hw_model = mr.get_model(f"aqi_forecast_model_{horizon_name}")
+                    # get_models (plural) returns ALL versions; get_model
+                    # (singular) without a version defaults to version 1,
+                    # which would silently serve a stale/outdated model
+                    # after retraining. Always pick the highest version.
+                    candidates = mr.get_models(name=f"aqi_forecast_model_{horizon_name}")
+                    hw_model = max(candidates, key=lambda m: m.version)
                     model_dir = Path(hw_model.download())
                     results[horizon_name] = _load_bundle_from_dir(model_dir)
                 except Exception:
@@ -304,6 +308,7 @@ def load_all_models():
                 return results
         except Exception as e:
             st.warning(f"Could not load models from Hopsworks ({e}); using local models instead.")
+
 
     results = {}
     for horizon_name in HORIZONS:

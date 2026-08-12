@@ -100,12 +100,12 @@ def load_horizon_model(horizon_name: str):
         try:
             project = _get_hopsworks_project()
             mr = project.get_model_registry()
-            hw_model = mr.get_model(f"aqi_forecast_model_{horizon_name}")
+            candidates = mr.get_models(name=f"aqi_forecast_model_{horizon_name}")
+            hw_model = max(candidates, key=lambda m: m.version)
             model_dir = Path(hw_model.download())
             return _load_bundle_from_dir(model_dir)
         except Exception:
             pass
-
     horizon_dir = MODELS_DIR / horizon_name
     if horizon_dir.exists():
         return _load_bundle_from_dir(horizon_dir)

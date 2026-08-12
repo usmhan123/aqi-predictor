@@ -3,21 +3,13 @@ Feature Pipeline — AQI Predictor
 ==================================
 Step 1 of the AQI Predictor project.
 
-What this script does:
-1. Fetches raw weather + pollutant data from OpenWeather
-   (Current Weather API + Air Pollution API — one API key covers both).
-2. Computes model-ready features:
-   - Raw pollutant concentrations (PM2.5, PM10, O3, NO2, SO2, CO)
-   - Raw weather variables (temp, humidity, wind, pressure)
-   - Time-based features (hour, day, month, day_of_week)
-   - Derived features (AQI change rate vs. the previous stored reading)
-3. Stores the resulting feature row in:
-   - Hopsworks Feature Store, if HOPSWORKS_API_KEY is set, OR
-   - A local CSV file (data/features.csv) as a fallback.
-
 Run modes:
   python feature_pipeline.py                # fetch "now" and store one row
   python feature_pipeline.py --backfill 30   # backfill last 30 days
+
+BACKFILL NOTE: historical weather for backfilled rows is fetched from
+Open-Meteo's free historical weather archive (no API key needed) and
+matched to each pollution reading's actual timestamp.
 """
 
 import os
@@ -46,10 +38,10 @@ LOCAL_CSV = DATA_DIR / "features.csv"
 AIR_POLLUTION_URL = "http://api.openweathermap.org/data/2.5/air_pollution"
 AIR_POLLUTION_HISTORY_URL = "http://api.openweathermap.org/data/2.5/air_pollution/history"
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 
 def fetch_current_pollution():
-    """Fetch current air pollution data."""
     params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY}
     resp = requests.get(AIR_POLLUTION_URL, params=params, timeout=15)
     resp.raise_for_status()
@@ -57,7 +49,6 @@ def fetch_current_pollution():
 
 
 def fetch_pollution_history(start_unix, end_unix):
-    """Fetch historical air pollution data for a unix time range."""
     params = {
         "lat": LAT, "lon": LON,
         "start": start_unix, "end": end_unix,
@@ -69,15 +60,63 @@ def fetch_pollution_history(start_unix, end_unix):
 
 
 def fetch_current_weather():
-    """Fetch current weather (temperature, humidity, wind, pressure)."""
     params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY, "units": "metric"}
     resp = requests.get(WEATHER_URL, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
+def fetch_historical_weather_lookup(start_date: dt.date, end_date: dt.date) -> dict:
+    """
+    Fetch real historical weather for a date range from Open-Meteo's free
+    archive API (no key required), keyed by hour-truncated UTC datetime,
+    shaped like an OpenWeather /weather response.
+    """
+    params = {
+        "latitude": LAT,
+        "longitude": LON,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "hourly": "temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover",
+        "timezone": "UTC",
+    }
+    resp = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+    resp.raise_for_status()
+    hourly = resp.json()["hourly"]
+
+    lookup = {}
+    for i, t in enumerate(hourly["time"]):
+        ts = dt.datetime.fromisoformat(t).replace(tzinfo=dt.timezone.utc)
+        lookup[ts] = {
+            "main": {
+                "temp": hourly["temperature_2m"][i],
+                "humidity": hourly["relative_humidity_2m"][i],
+                "pressure": hourly["surface_pressure"][i],
+            },
+            "wind": {
+                "speed": hourly["wind_speed_10m"][i],
+                "deg": hourly["wind_direction_10m"][i],
+            },
+            "clouds": {"all": hourly["cloud_cover"][i]},
+        }
+    return lookup
+
+
+def nearest_weather(lookup: dict, timestamp: dt.datetime, fallback: dict) -> dict:
+    """Weather for the closest hour to `timestamp`; falls back to `fallback`
+    if the lookup is empty or the timestamp is too far outside it."""
+    if not lookup:
+        return fallback
+    hour_ts = timestamp.replace(minute=0, second=0, microsecond=0)
+    if hour_ts in lookup:
+        return lookup[hour_ts]
+    nearest_key = min(lookup.keys(), key=lambda k: abs((k - hour_ts).total_seconds()))
+    if abs((nearest_key - hour_ts).total_seconds()) > 3 * 3600:
+        return fallback
+    return lookup[nearest_key]
+
+
 def openweather_aqi_to_us_aqi(components: dict) -> float:
-    """Convert raw PM2.5 concentration (µg/m³) to a US EPA-style AQI value."""
     pm25 = components.get("pm2_5", 0)
     breakpoints = [
         (0.0, 12.0, 0, 50),
@@ -95,7 +134,6 @@ def openweather_aqi_to_us_aqi(components: dict) -> float:
 
 
 def build_feature_row(pollution: dict, weather: dict, timestamp: dt.datetime) -> dict:
-    """Turn one raw (pollution, weather) reading into a flat feature row."""
     components = pollution["components"]
     aqi_us = openweather_aqi_to_us_aqi(components)
 
@@ -126,14 +164,12 @@ def build_feature_row(pollution: dict, weather: dict, timestamp: dt.datetime) ->
 
 
 def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add AQI change-rate feature relative to the previous row, once sorted by time."""
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["aqi_change_rate"] = df["aqi_us"].diff().fillna(0)
     return df
 
 
 def store_to_hopsworks(df: pd.DataFrame):
-    """Push the feature dataframe to a Hopsworks Feature Group."""
     import hopsworks
 
     df = df.copy()
@@ -172,7 +208,6 @@ def store_to_hopsworks(df: pd.DataFrame):
 
 
 def store_locally(df: pd.DataFrame):
-    """Append the feature dataframe to a local CSV (fallback / no Hopsworks yet)."""
     DATA_DIR.mkdir(exist_ok=True)
     if LOCAL_CSV.exists():
         existing = pd.read_csv(LOCAL_CSV)
@@ -208,7 +243,6 @@ def run_current():
 
 
 def add_derived_features_with_history(new_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute aqi_change_rate using the last stored row (from local CSV) as context."""
     if LOCAL_CSV.exists():
         history = pd.read_csv(LOCAL_CSV)
         history = history[history["city"] == CITY_NAME]
@@ -233,18 +267,27 @@ def run_backfill(days: int):
     except requests.HTTPError as e:
         sys.exit(
             "Historical air-pollution request failed "
-            f"({e}). Your OpenWeather plan may not include history access. "
-            "Run this script hourly via GitHub Actions instead to build up real history over time."
+            f"({e}). Your OpenWeather plan may not include history access."
         )
 
     if not history_list:
         sys.exit("No historical data returned. Try a smaller --backfill window or check your plan.")
 
-    weather_now = fetch_current_weather()
+    print("Fetching matching historical weather from Open-Meteo (free, per-timestamp)...")
+    try:
+        weather_lookup = fetch_historical_weather_lookup(start.date(), end.date())
+        print(f"  Got {len(weather_lookup)} hourly weather points.")
+    except Exception as e:
+        print(f"[warn] Historical weather fetch failed ({e}); falling back to current weather for all rows.")
+        weather_lookup = {}
+
+    weather_fallback = fetch_current_weather()
+
     rows = []
     for entry in history_list:
         ts = dt.datetime.fromtimestamp(entry["dt"], tz=dt.timezone.utc)
-        rows.append(build_feature_row(entry, weather_now, ts))
+        weather = nearest_weather(weather_lookup, ts, weather_fallback)
+        rows.append(build_feature_row(entry, weather, ts))
 
     df = pd.DataFrame(rows)
     df = add_derived_features(df)
