@@ -293,11 +293,7 @@ def load_all_models():
             project = _get_hopsworks_project()
             mr = project.get_model_registry()
             for horizon_name in HORIZONS:
-                try:
-                    # get_models (plural) returns ALL versions; get_model
-                    # (singular) without a version defaults to version 1,
-                    # which would silently serve a stale/outdated model
-                    # after retraining. Always pick the highest version.
+                   try:
                     candidates = mr.get_models(name=f"aqi_forecast_model_{horizon_name}")
                     hw_model = max(candidates, key=lambda m: m.version)
                     model_dir = Path(hw_model.download())
