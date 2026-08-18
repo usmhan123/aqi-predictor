@@ -4,12 +4,16 @@ Feature Pipeline — AQI Predictor
 Step 1 of the AQI Predictor project.
 
 Run modes:
-  python feature_pipeline.py                # fetch "now" and store one row
-  python feature_pipeline.py --backfill 30   # backfill last 30 days
+  python feature_pipeline.py                          # fetch "now" and store one row
+  python feature_pipeline.py --backfill 180            # backfill last 180 days (chunked, safe for large ranges)
+  python feature_pipeline.py --backfill 365 --local-only   # backfill to local CSV only (skip Hopsworks, e.g. to protect a tight compute budget)
+  python feature_pipeline.py --push-local              # one-time: push everything in data/features.csv to Hopsworks
 
-BACKFILL NOTE: historical weather for backfilled rows is fetched from
-Open-Meteo's free historical weather archive (no API key needed) and
-matched to each pollution reading's actual timestamp.
+Historical weather for backfilled rows is fetched from Open-Meteo's free
+archive API (no key needed) and matched to each pollution reading's
+actual timestamp. Large backfills are processed in 30-day chunks so
+progress is saved incrementally and a single failure doesn't lose
+everything already fetched.
 """
 
 import os
@@ -40,6 +44,8 @@ AIR_POLLUTION_HISTORY_URL = "http://api.openweathermap.org/data/2.5/air_pollutio
 WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
+BACKFILL_CHUNK_DAYS = 30
+
 
 def fetch_current_pollution():
     params = {"lat": LAT, "lon": LON, "appid": OPENWEATHER_API_KEY}
@@ -54,7 +60,7 @@ def fetch_pollution_history(start_unix, end_unix):
         "start": start_unix, "end": end_unix,
         "appid": OPENWEATHER_API_KEY,
     }
-    resp = requests.get(AIR_POLLUTION_HISTORY_URL, params=params, timeout=15)
+    resp = requests.get(AIR_POLLUTION_HISTORY_URL, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json().get("list", [])
 
@@ -67,11 +73,6 @@ def fetch_current_weather():
 
 
 def fetch_historical_weather_lookup(start_date: dt.date, end_date: dt.date) -> dict:
-    """
-    Fetch real historical weather for a date range from Open-Meteo's free
-    archive API (no key required), keyed by hour-truncated UTC datetime,
-    shaped like an OpenWeather /weather response.
-    """
     params = {
         "latitude": LAT,
         "longitude": LON,
@@ -103,8 +104,6 @@ def fetch_historical_weather_lookup(start_date: dt.date, end_date: dt.date) -> d
 
 
 def nearest_weather(lookup: dict, timestamp: dt.datetime, fallback: dict) -> dict:
-    """Weather for the closest hour to `timestamp`; falls back to `fallback`
-    if the lookup is empty or the timestamp is too far outside it."""
     if not lookup:
         return fallback
     hour_ts = timestamp.replace(minute=0, second=0, microsecond=0)
@@ -173,7 +172,7 @@ def store_to_hopsworks(df: pd.DataFrame):
     import hopsworks
 
     df = df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], format="ISO8601")
 
     float_columns = [
         "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
@@ -219,8 +218,8 @@ def store_locally(df: pd.DataFrame):
     print(f"Stored {len(df)} row(s) locally. Total rows now: {len(combined)} -> {LOCAL_CSV}")
 
 
-def store_features(df: pd.DataFrame):
-    if HOPSWORKS_API_KEY:
+def store_features(df: pd.DataFrame, local_only: bool = False):
+    if not local_only and HOPSWORKS_API_KEY:
         try:
             store_to_hopsworks(df)
             return
@@ -254,31 +253,21 @@ def add_derived_features_with_history(new_df: pd.DataFrame) -> pd.DataFrame:
     return new_df
 
 
-def run_backfill(days: int):
-    if not OPENWEATHER_API_KEY:
-        sys.exit("ERROR: OPENWEATHER_API_KEY not set. Copy .env.example to .env and fill it in.")
-
-    end = dt.datetime.now(dt.timezone.utc)
-    start = end - dt.timedelta(days=days)
-    print(f"Backfilling pollution history from {start} to {end} ...")
-
+def backfill_one_window(window_start: dt.datetime, window_end: dt.datetime, local_only: bool) -> int:
     try:
-        history_list = fetch_pollution_history(int(start.timestamp()), int(end.timestamp()))
+        history_list = fetch_pollution_history(int(window_start.timestamp()), int(window_end.timestamp()))
     except requests.HTTPError as e:
-        sys.exit(
-            "Historical air-pollution request failed "
-            f"({e}). Your OpenWeather plan may not include history access."
-        )
+        print(f"  [warn] Pollution history request failed for {window_start.date()}..{window_end.date()} ({e}); skipping this window.")
+        return 0
 
     if not history_list:
-        sys.exit("No historical data returned. Try a smaller --backfill window or check your plan.")
+        print(f"  No data for {window_start.date()}..{window_end.date()}, skipping.")
+        return 0
 
-    print("Fetching matching historical weather from Open-Meteo (free, per-timestamp)...")
     try:
-        weather_lookup = fetch_historical_weather_lookup(start.date(), end.date())
-        print(f"  Got {len(weather_lookup)} hourly weather points.")
+        weather_lookup = fetch_historical_weather_lookup(window_start.date(), window_end.date())
     except Exception as e:
-        print(f"[warn] Historical weather fetch failed ({e}); falling back to current weather for all rows.")
+        print(f"  [warn] Historical weather fetch failed ({e}); using current weather as fallback for this window.")
         weather_lookup = {}
 
     weather_fallback = fetch_current_weather()
@@ -291,15 +280,70 @@ def run_backfill(days: int):
 
     df = pd.DataFrame(rows)
     df = add_derived_features(df)
-    store_features(df)
+    store_features(df, local_only=local_only)
+    return len(df)
+
+
+def run_backfill(days: int, local_only: bool = False):
+    if not OPENWEATHER_API_KEY:
+        sys.exit("ERROR: OPENWEATHER_API_KEY not set. Copy .env.example to .env and fill it in.")
+
+    end = dt.datetime.now(dt.timezone.utc)
+    overall_start = end - dt.timedelta(days=days)
+
+    if local_only:
+        print("Running in --local-only mode: all rows go to data/features.csv, Hopsworks is skipped.")
+
+    print(f"Backfilling from {overall_start.date()} to {end.date()} ({days} days) in {BACKFILL_CHUNK_DAYS}-day chunks...")
+
+    total_stored = 0
+    window_end = end
+    chunk_num = 0
+    while window_end > overall_start:
+        window_start = max(overall_start, window_end - dt.timedelta(days=BACKFILL_CHUNK_DAYS))
+        chunk_num += 1
+        print(f"\nChunk {chunk_num}: {window_start.date()} to {window_end.date()}")
+        stored = backfill_one_window(window_start, window_end, local_only)
+        total_stored += stored
+        window_end = window_start
+
+    print(f"\nBackfill complete. Total rows stored across all chunks: {total_stored}")
+    if local_only:
+        print("Rows were saved locally only. Run `python feature_pipeline.py --push-local` later to upload them to Hopsworks.")
+
+
+def push_local_to_hopsworks(chunk_size: int = 500):
+    if not HOPSWORKS_API_KEY:
+        sys.exit("ERROR: HOPSWORKS_API_KEY not set -- nothing to push to.")
+    if not LOCAL_CSV.exists():
+        sys.exit(f"ERROR: {LOCAL_CSV} does not exist -- nothing to push.")
+
+    df = pd.read_csv(LOCAL_CSV)
+    df = df[df["city"] == CITY_NAME]
+    print(f"Pushing {len(df)} local rows to Hopsworks in chunks of {chunk_size}...")
+
+    for i in range(0, len(df), chunk_size):
+        chunk = df.iloc[i:i + chunk_size]
+        print(f"  Uploading rows {i} to {i + len(chunk)}...")
+        try:
+            store_to_hopsworks(chunk)
+        except Exception as e:
+            print(f"  [warn] Chunk failed ({e}); stopping here. Re-run this command later to continue.")
+            return
+
+    print("Done. All local rows pushed to Hopsworks.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AQI Predictor feature pipeline")
     parser.add_argument("--backfill", type=int, default=0, help="Number of past days to backfill")
+    parser.add_argument("--local-only", action="store_true", help="During backfill, store only to local CSV (skip Hopsworks)")
+    parser.add_argument("--push-local", action="store_true", help="One-time: push all rows in data/features.csv to Hopsworks")
     args = parser.parse_args()
 
-    if args.backfill > 0:
-        run_backfill(args.backfill)
+    if args.push_local:
+        push_local_to_hopsworks()
+    elif args.backfill > 0:
+        run_backfill(args.backfill, local_only=args.local_only)
     else:
         run_current()
