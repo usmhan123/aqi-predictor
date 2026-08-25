@@ -3,10 +3,6 @@ Web App — AQI Predictor Dashboard
 ====================================
 Step 4 of the AQI Predictor project.
 
-Loads models/features from Hopsworks (or local fallback), computes a
-day-by-day 3-day AQI forecast, and renders it in a custom-styled
-dashboard (dark "atmosphere" theme with a live AQI gradient scale).
-
 Run:
   streamlit run app.py
 """
@@ -34,12 +30,6 @@ LOCAL_CSV = DATA_DIR / "features.csv"
 MODELS_DIR = Path(__file__).parent / "models"
 
 HORIZONS = {"day1": ("Day 1", 24), "day2": ("Day 2", 48), "day3": ("Day 3", 72)}
-
-FEATURE_COLUMNS = [
-    "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
-    "temp_c", "humidity", "pressure", "wind_speed", "wind_deg", "clouds_pct",
-    "hour", "day", "month", "day_of_week", "aqi_change_rate",
-]
 
 AQI_CATEGORIES = [
     (0, 50, "Good", "#4ADE9A"),
@@ -73,165 +63,39 @@ def categorize_aqi(aqi: float):
         return AQI_CATEGORIES[5][2], AQI_CATEGORIES[5][3]
 
 
+def add_persistence_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Must match training_pipeline.py's feature engineering exactly."""
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["aqi_lag_24h"] = df["aqi_us"].shift(24)
+    df["aqi_rolling_24h_mean"] = df["aqi_us"].rolling(window=24, min_periods=1).mean()
+    return df
+
+
 def inject_css():
     st.markdown(f"""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
-
-    html, body, [class*="css"] {{
-        font-family: 'Inter', sans-serif;
-    }}
-    .stApp {{
-        background: {BG};
-        color: {TEXT};
-    }}
+    html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
+    .stApp {{ background: {BG}; color: {TEXT}; }}
     #MainMenu, footer, header {{visibility: hidden;}}
-
-    .hero-title {{
-        font-family: 'Space Grotesk', sans-serif;
-        font-weight: 700;
-        font-size: 2.6rem;
-        letter-spacing: -0.02em;
-        margin-bottom: 0.1rem;
-        color: {TEXT};
-    }}
-    .hero-sub {{
-        font-family: 'Inter', sans-serif;
-        color: {TEXT_DIM};
-        font-size: 1rem;
-        margin-bottom: 2rem;
-    }}
-    .section-label {{
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.72rem;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        color: {TEXT_DIM};
-        margin-bottom: 0.6rem;
-    }}
-
-    .aqi-hero {{
-        background: {SURFACE};
-        border: 1px solid {BORDER};
-        border-radius: 20px;
-        padding: 2rem 2.2rem;
-        margin-bottom: 1.6rem;
-    }}
-    .aqi-hero-number {{
-        font-family: 'Space Grotesk', sans-serif;
-        font-weight: 700;
-        font-size: 4.2rem;
-        line-height: 1;
-        margin-bottom: 0.4rem;
-    }}
-    .aqi-pill {{
-        display: inline-block;
-        font-family: 'Inter', sans-serif;
-        font-weight: 600;
-        font-size: 0.85rem;
-        padding: 0.35rem 0.9rem;
-        border-radius: 999px;
-        margin-bottom: 0.7rem;
-    }}
-    .aqi-caption {{
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.75rem;
-        color: {TEXT_DIM};
-    }}
-
-    .scale-wrap {{
-        background: {SURFACE};
-        border: 1px solid {BORDER};
-        border-radius: 16px;
-        padding: 1.4rem 1.6rem 2.2rem 1.6rem;
-        margin-bottom: 1.8rem;
-        position: relative;
-    }}
-    .scale-bar {{
-        height: 10px;
-        border-radius: 999px;
-        background: linear-gradient(90deg,
-            #4ADE9A 0%, #4ADE9A 10%,
-            #F5C24D 10%, #F5C24D 20%,
-            #F5934D 20%, #F5934D 30%,
-            #F0576B 30%, #F0576B 40%,
-            #B564E8 40%, #B564E8 60%,
-            #E23D6B 60%, #E23D6B 100%);
-        position: relative;
-        margin-top: 0.4rem;
-    }}
-    .scale-marker {{
-        position: absolute;
-        top: -8px;
-        width: 2px;
-        height: 26px;
-        background: {TEXT};
-        transform: translateX(-1px);
-    }}
-    .scale-marker-label {{
-        position: absolute;
-        top: 20px;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.65rem;
-        color: {TEXT_DIM};
-        transform: translateX(-50%);
-        white-space: nowrap;
-    }}
-    .scale-ticks {{
-        display: flex;
-        justify-content: space-between;
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.65rem;
-        color: {TEXT_DIM};
-        margin-top: 0.5rem;
-    }}
-
-    .forecast-card {{
-        background: {SURFACE};
-        border: 1px solid {BORDER};
-        border-radius: 16px;
-        padding: 1.3rem 1.2rem;
-        text-align: left;
-        height: 100%;
-    }}
-    .forecast-day {{
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.72rem;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: {TEXT_DIM};
-        margin-bottom: 0.5rem;
-    }}
-    .forecast-number {{
-        font-family: 'Space Grotesk', sans-serif;
-        font-weight: 700;
-        font-size: 2.2rem;
-        line-height: 1;
-        margin-bottom: 0.5rem;
-    }}
-    .forecast-model {{
-        font-family: 'JetBrains Mono', monospace;
-        font-size: 0.68rem;
-        color: {TEXT_DIM};
-        margin-top: 0.6rem;
-    }}
-    .not-trained {{
-        font-family: 'Inter', sans-serif;
-        color: {TEXT_DIM};
-        font-size: 0.85rem;
-        padding: 1.5rem 0;
-    }}
-
-    .hazard-banner {{
-        background: rgba(226,61,107,0.12);
-        border: 1px solid rgba(226,61,107,0.4);
-        border-radius: 14px;
-        padding: 1rem 1.3rem;
-        color: #FFB3C6;
-        font-family: 'Inter', sans-serif;
-        font-size: 0.92rem;
-        margin-bottom: 1.6rem;
-    }}
+    .hero-title {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 2.6rem; letter-spacing: -0.02em; margin-bottom: 0.1rem; color: {TEXT}; }}
+    .hero-sub {{ font-family: 'Inter', sans-serif; color: {TEXT_DIM}; font-size: 1rem; margin-bottom: 2rem; }}
+    .section-label {{ font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; color: {TEXT_DIM}; margin-bottom: 0.6rem; }}
+    .aqi-hero {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 20px; padding: 2rem 2.2rem; margin-bottom: 1.6rem; }}
+    .aqi-hero-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 4.2rem; line-height: 1; margin-bottom: 0.4rem; }}
+    .aqi-pill {{ display: inline-block; font-family: 'Inter', sans-serif; font-weight: 600; font-size: 0.85rem; padding: 0.35rem 0.9rem; border-radius: 999px; margin-bottom: 0.7rem; }}
+    .aqi-caption {{ font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; color: {TEXT_DIM}; }}
+    .scale-wrap {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 16px; padding: 1.4rem 1.6rem 2.2rem 1.6rem; margin-bottom: 1.8rem; position: relative; }}
+    .scale-bar {{ height: 10px; border-radius: 999px; background: linear-gradient(90deg, #4ADE9A 0%, #4ADE9A 10%, #F5C24D 10%, #F5C24D 20%, #F5934D 20%, #F5934D 30%, #F0576B 30%, #F0576B 40%, #B564E8 40%, #B564E8 60%, #E23D6B 60%, #E23D6B 100%); position: relative; margin-top: 0.4rem; }}
+    .scale-marker {{ position: absolute; top: -8px; width: 2px; height: 26px; background: {TEXT}; transform: translateX(-1px); }}
+    .scale-marker-label {{ position: absolute; top: 20px; font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: {TEXT_DIM}; transform: translateX(-50%); white-space: nowrap; }}
+    .scale-ticks {{ display: flex; justify-content: space-between; font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: {TEXT_DIM}; margin-top: 0.5rem; }}
+    .forecast-card {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 16px; padding: 1.3rem 1.2rem; text-align: left; height: 100%; }}
+    .forecast-day {{ font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: {TEXT_DIM}; margin-bottom: 0.5rem; }}
+    .forecast-number {{ font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 2.2rem; line-height: 1; margin-bottom: 0.5rem; }}
+    .forecast-model {{ font-family: 'JetBrains Mono', monospace; font-size: 0.68rem; color: {TEXT_DIM}; margin-top: 0.6rem; }}
+    .not-trained {{ font-family: 'Inter', sans-serif; color: {TEXT_DIM}; font-size: 0.85rem; padding: 1.5rem 0; }}
+    .hazard-banner {{ background: rgba(226,61,107,0.12); border: 1px solid rgba(226,61,107,0.4); border-radius: 14px; padding: 1rem 1.3rem; color: #FFB3C6; font-family: 'Inter', sans-serif; font-size: 0.92rem; margin-bottom: 1.6rem; }}
     </style>
     """, unsafe_allow_html=True)
 
@@ -285,9 +149,12 @@ def _load_bundle_from_dir(model_dir: Path):
     return bundle, metadata
 
 
-@st.cache_resource
+# ttl=1800 (30 min): without this, Streamlit caches the loaded models
+# forever until the app process restarts, so newly-retrained models
+# uploaded to Hopsworks would never be picked up by a long-running
+# deployed app. This was flagged in review and is fixed here.
+@st.cache_resource(ttl=1800)
 def load_all_models():
-    """Load all three horizon models (day1/day2/day3), whichever are available."""
     results = {}
 
     if HOPSWORKS_API_KEY:
@@ -316,6 +183,7 @@ def load_all_models():
             results[horizon_name] = (None, None)
     return results
 
+
 def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
     model = bundle["model"]
     scaler = bundle.get("scaler")
@@ -335,16 +203,13 @@ def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
 
 
 def render_scale_bar(current_aqi: float, forecast_values: dict):
-    """The signature element: a live 0-500 AQI gradient scale with markers
-    for 'now' and each forecasted day, so position on the real EPA scale
-    is visible at a glance rather than just a colored number."""
     def pos(v):
         return max(0, min(100, v / 500 * 100))
 
     markers_html = f'<div class="scale-marker" style="left:{pos(current_aqi)}%;"></div>'
     markers_html += f'<div class="scale-marker-label" style="left:{pos(current_aqi)}%;">NOW &middot; {current_aqi:.0f}</div>'
 
-    for key, (label, _) in HORIZONS.items():
+    for key in HORIZONS:
         if key in forecast_values:
             v = forecast_values[key]
             markers_html += f'<div class="scale-marker" style="left:{pos(v)}%; opacity:0.55;"></div>'
@@ -369,12 +234,10 @@ def main():
 
     df = load_history()
     if df.empty:
-        st.error(
-            "No feature data found yet. Make sure feature_pipeline.py (or the "
-            "hourly GitHub Action) has run at least once."
-        )
+        st.error("No feature data found yet.")
         st.stop()
 
+    df = add_persistence_features(df)
     latest = df.iloc[-1]
     current_aqi = float(latest["aqi_us"])
     current_label, current_color = categorize_aqi(current_aqi)
@@ -446,9 +309,7 @@ def main():
     for lo, hi, label, color in AQI_CATEGORIES:
         fig.add_hrect(y0=lo, y1=hi, fillcolor=color, opacity=0.06, line_width=0)
     fig.update_layout(
-        height=380,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        height=380, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Inter, sans-serif", color=TEXT_DIM),
         xaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="Time"),
         yaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="AQI (US)"),
@@ -462,14 +323,9 @@ def main():
         if shap_importance and bundle is not None:
             st.markdown(f'<div class="section-label">What\'s driving the {day_label} forecast (SHAP)</div>', unsafe_allow_html=True)
             importances = pd.Series(shap_importance).sort_values(ascending=False).head(8)
-            fig2 = go.Figure(go.Bar(
-                x=importances.values, y=importances.index, orientation="h",
-                marker=dict(color="#7DD3C0"),
-            ))
+            fig2 = go.Figure(go.Bar(x=importances.values, y=importances.index, orientation="h", marker=dict(color="#7DD3C0")))
             fig2.update_layout(
-                height=300,
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
+                height=300, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                 font=dict(family="Inter, sans-serif", color=TEXT_DIM),
                 xaxis=dict(gridcolor="rgba(255,255,255,0.06)", title="Mean |SHAP value|"),
                 yaxis=dict(autorange="reversed", gridcolor="rgba(255,255,255,0.06)"),

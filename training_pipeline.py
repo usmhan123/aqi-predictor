@@ -6,24 +6,19 @@ Step 2 of the AQI Predictor project.
 What this script does:
 1. Loads accumulated (features, target) data from the Feature Store
    (Hopsworks if configured, otherwise the local data/features.csv).
-2. Builds THREE separate prediction targets, matching the project's
-   "next 3 days" forecast requirement:
-     - Day 1 ahead  (24 hourly readings ahead)
-     - Day 2 ahead  (48 hourly readings ahead)
-     - Day 3 ahead  (72 hourly readings ahead)
-   Training one model per horizon gives an actual day-by-day 3-day
-   forecast (like a weather app), rather than a single point estimate
-   for "3 days from now".
-3. For each horizon, trains and evaluates FOUR models: Ridge Regression,
+2. Adds AQI persistence features (24h lag, 24h rolling mean) -- these
+   capture day-to-day autocorrelation in AQI and meaningfully help
+   longer-horizon (48h/72h) forecasts, which otherwise only see
+   instantaneous pollutant/weather readings.
+3. Builds THREE separate prediction targets (Day 1/2/3 ahead).
+4. For each horizon, trains and evaluates 4 models: Ridge Regression,
    Random Forest, an MLP (scikit-learn), and a TensorFlow/Keras deep
    neural network -- then keeps whichever performs best (lowest RMSE).
-4. Evaluates with RMSE, MAE, and R^2 on a held-out time-based test split.
-5. Computes SHAP feature-importance explanations for whichever model
-   type won each horizon (Random Forest, Ridge, MLP, or TensorFlow).
-6. Saves each horizon's best model (+ metadata, including SHAP values)
-   to Hopsworks Model Registry if configured (as three separate
-   registered models), else to a local `models/day1/`, `models/day2/`,
-   `models/day3/` folder each.
+5. Evaluates with RMSE, MAE, and R^2 on a held-out time-based test split.
+6. Computes SHAP feature importance for whichever model type won.
+7. Saves each horizon's best model (+ metadata) to Hopsworks Model
+   Registry if configured (as three separate registered models), else to
+   a local `models/day1/`, `models/day2/`, `models/day3/` folder each.
 
 Usage:
   python training_pipeline.py
@@ -63,10 +58,15 @@ HORIZONS = {
 }
 MIN_EXTRA_ROWS = 48
 
+# Base pollutant/weather/time features, plus AQI persistence features
+# (24h lag and 24h rolling mean) -- persistence features are added
+# because longer-horizon (48h/72h) forecasts benefit strongly from
+# knowing the recent AQI trend, not just instantaneous readings.
 FEATURE_COLUMNS = [
     "pm2_5", "pm10", "o3", "no2", "so2", "co", "nh3", "no",
     "temp_c", "humidity", "pressure", "wind_speed", "wind_deg", "clouds_pct",
     "hour", "day", "month", "day_of_week", "aqi_change_rate",
+    "aqi_lag_24h", "aqi_rolling_24h_mean",
 ]
 TARGET_COLUMN = "aqi_us"
 
@@ -99,6 +99,14 @@ def load_data() -> pd.DataFrame:
     df = pd.read_csv(LOCAL_CSV)
     df = df[df["city"] == CITY_NAME]
     print(f"Loaded {len(df)} rows from local CSV for city={CITY_NAME}.")
+    return df
+
+
+def add_persistence_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add AQI lag (24h ago) and rolling mean (last 24h) features."""
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["aqi_lag_24h"] = df[TARGET_COLUMN].shift(24)
+    df["aqi_rolling_24h_mean"] = df[TARGET_COLUMN].rolling(window=24, min_periods=1).mean()
     return df
 
 
@@ -168,7 +176,7 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
         early_stop = tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=10, restore_best_weights=True)
         tf_model.fit(
             X_train_scaled, y_train,
-            validation_split=0.15, epochs=100, batch_size=16,
+            validation_split=0.15, epochs=100, batch_size=32,
             callbacks=[early_stop], verbose=0,
         )
         tf_preds = tf_model.predict(X_test_scaled, verbose=0).flatten()
@@ -181,16 +189,6 @@ def train_and_evaluate(train_df: pd.DataFrame, test_df: pd.DataFrame):
 
 
 def compute_shap_importance(model, model_name: str, scaler, X_train: pd.DataFrame, X_test: pd.DataFrame, feature_names):
-    """
-    Compute SHAP feature importance for whichever model type won this
-    horizon. Dispatches to the right SHAP explainer per model family:
-      - Random Forest    -> TreeExplainer (fast, exact)
-      - Ridge             -> LinearExplainer
-      - MLP / TensorFlow  -> KernelExplainer (model-agnostic, slower --
-        kept small with a limited background/sample size)
-    Returns a dict of {feature_name: mean_abs_shap_value}, sorted
-    descending, or None if SHAP computation isn't feasible.
-    """
     try:
         import shap
 
@@ -232,7 +230,6 @@ def print_shap_importance(shap_importance: dict):
 
 
 def _save_model_files(model, scaler, target_dir: Path):
-    """Save a trained model, handling both scikit-learn (joblib) and Keras (.keras) formats."""
     target_dir.mkdir(parents=True, exist_ok=True)
     is_keras = hasattr(model, "save") and "keras" in str(type(model)).lower()
 
@@ -246,7 +243,6 @@ def _save_model_files(model, scaler, target_dir: Path):
 
 
 def train_one_horizon(df: pd.DataFrame, horizon_name: str, horizon_hours: int):
-    """Train, evaluate, and save the best model for a single forecast horizon."""
     print(f"\n{'=' * 60}\nHorizon: {horizon_name} (+{horizon_hours}h)\n{'=' * 60}")
 
     horizon_df = build_forecast_target(df, horizon_hours)
@@ -255,8 +251,7 @@ def train_one_horizon(df: pd.DataFrame, horizon_name: str, horizon_hours: int):
     if len(horizon_df) < min_rows_required:
         print(
             f"  Not enough data yet: have {len(horizon_df)} usable rows, need {min_rows_required}. "
-            f"Skipping this horizon for now -- it will train automatically once enough hourly "
-            f"data has accumulated."
+            f"Skipping this horizon for now."
         )
         return None
 
@@ -315,7 +310,6 @@ def store_locally(horizon_results: dict):
 
 
 def store_to_hopsworks(horizon_results: dict):
-    """Push each horizon's best model to the Hopsworks Model Registry as a separate registered model."""
     import hopsworks
 
     cert_dir = Path(__file__).parent / "hopsworks_certs"
@@ -359,17 +353,14 @@ def store_to_hopsworks(horizon_results: dict):
 
 def main():
     df = load_data()
+    df = add_persistence_features(df)
 
     horizon_results = {}
     for horizon_name, horizon_hours in HORIZONS.items():
         horizon_results[horizon_name] = train_one_horizon(df, horizon_name, horizon_hours)
 
     if all(v is None for v in horizon_results.values()):
-        sys.exit(
-            "\nNo horizon had enough data to train yet. Let feature_pipeline.py / the "
-            "GitHub Action keep running hourly and try again in a few days. This is "
-            "expected, not an error in your code."
-        )
+        sys.exit("\nNo horizon had enough data to train yet.")
 
     if HOPSWORKS_API_KEY:
         try:

@@ -1,17 +1,8 @@
 """
 API — AQI Predictor (FastAPI)
 ================================
-Additional access point for the AQI Predictor project, alongside the
-Streamlit dashboard (app.py). Exposes the same current-AQI + 3-day
-forecast data as a JSON API, for programmatic access or integration
-with other tools.
-
 Run:
   uvicorn api:app --reload
-
-Then visit:
-  http://127.0.0.1:8000/forecast          -- current AQI + 3-day forecast (JSON)
-  http://127.0.0.1:8000/docs              -- interactive API docs (Swagger UI)
 """
 
 import os
@@ -39,26 +30,24 @@ MODELS_DIR = Path(__file__).parent / "models"
 HORIZONS = {"day1": 24, "day2": 48, "day3": 72}
 HAZARD_THRESHOLD = 150
 
-app = FastAPI(
-    title="AQI Predictor API",
-    description="Serves current AQI and a day-by-day 3-day forecast for the configured city.",
-    version="1.0.0",
-)
+app = FastAPI(title="AQI Predictor API", version="1.0.0")
 
 
 def categorize_aqi(aqi: float) -> str:
-    if aqi <= 50:
-        return "Good"
-    elif aqi <= 100:
-        return "Moderate"
-    elif aqi <= 150:
-        return "Unhealthy for Sensitive Groups"
-    elif aqi <= 200:
-        return "Unhealthy"
-    elif aqi <= 300:
-        return "Very Unhealthy"
-    else:
-        return "Hazardous"
+    if aqi <= 50: return "Good"
+    elif aqi <= 100: return "Moderate"
+    elif aqi <= 150: return "Unhealthy for Sensitive Groups"
+    elif aqi <= 200: return "Unhealthy"
+    elif aqi <= 300: return "Very Unhealthy"
+    else: return "Hazardous"
+
+
+def add_persistence_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Must match training_pipeline.py's feature engineering exactly."""
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["aqi_lag_24h"] = df["aqi_us"].shift(24)
+    df["aqi_rolling_24h_mean"] = df["aqi_us"].rolling(window=24, min_periods=1).mean()
+    return df
 
 
 def _get_hopsworks_project():
@@ -66,11 +55,8 @@ def _get_hopsworks_project():
     cert_dir = Path(__file__).parent / "hopsworks_certs"
     cert_dir.mkdir(exist_ok=True)
     return hopsworks.login(
-        api_key_value=HOPSWORKS_API_KEY,
-        project=HOPSWORKS_PROJECT,
-        host=HOPSWORKS_HOST,
-        port=443,
-        cert_folder=str(cert_dir),
+        api_key_value=HOPSWORKS_API_KEY, project=HOPSWORKS_PROJECT,
+        host=HOPSWORKS_HOST, port=443, cert_folder=str(cert_dir),
     )
 
 
@@ -83,6 +69,7 @@ def load_latest_features() -> Optional[pd.Series]:
             df = fg.read()
             df = df[df["city"] == CITY_NAME].sort_values("timestamp")
             if not df.empty:
+                df = add_persistence_features(df)
                 return df.iloc[-1]
         except Exception:
             pass
@@ -91,6 +78,7 @@ def load_latest_features() -> Optional[pd.Series]:
         df = pd.read_csv(LOCAL_CSV)
         df = df[df["city"] == CITY_NAME].sort_values("timestamp")
         if not df.empty:
+            df = add_persistence_features(df)
             return df.iloc[-1]
     return None
 
@@ -106,6 +94,7 @@ def load_horizon_model(horizon_name: str):
             return _load_bundle_from_dir(model_dir)
         except Exception:
             pass
+
     horizon_dir = MODELS_DIR / horizon_name
     if horizon_dir.exists():
         return _load_bundle_from_dir(horizon_dir)
@@ -150,10 +139,7 @@ def predict_forecast(bundle: dict, latest_row: pd.Series) -> float:
 
 @app.get("/")
 def root():
-    return {
-        "message": "AQI Predictor API. See /docs for interactive documentation.",
-        "endpoints": ["/forecast", "/health"],
-    }
+    return {"message": "AQI Predictor API. See /docs.", "endpoints": ["/forecast", "/health"]}
 
 
 @app.get("/health")
@@ -163,19 +149,14 @@ def health():
 
 @app.get("/forecast")
 def get_forecast():
-    """Return current AQI plus a day-by-day 3-day forecast for the configured city."""
     latest = load_latest_features()
     if latest is None:
-        raise HTTPException(status_code=503, detail="No feature data available yet. Run feature_pipeline.py first.")
+        raise HTTPException(status_code=503, detail="No feature data available yet.")
 
     current_aqi = float(latest["aqi_us"])
     response = {
         "city": CITY_NAME,
-        "current": {
-            "aqi": round(current_aqi, 1),
-            "category": categorize_aqi(current_aqi),
-            "timestamp": str(latest["timestamp"]),
-        },
+        "current": {"aqi": round(current_aqi, 1), "category": categorize_aqi(current_aqi), "timestamp": str(latest["timestamp"])},
         "forecast": {},
     }
 
@@ -197,5 +178,4 @@ def get_forecast():
         }
 
     response["hazard_alert"] = worst_case >= HAZARD_THRESHOLD
-
     return response
